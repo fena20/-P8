@@ -818,12 +818,21 @@ def generate_figure5_predictions(
     groups: Optional[pd.Series] = None,
     group_name: str = "Division",
     sample_weight: Optional[np.ndarray] = None,
+    y_pred_rf_calibrated: Optional[np.ndarray] = None,
+    y_pred_xgb_calibrated: Optional[np.ndarray] = None,
 ):
+    """
+    Plot predicted vs observed for RF and XGB, optionally overlaying calibrated predictions.
+
+    Calibration lines use regression of observed on predicted (slope toward 1 is desirable).
+    """
     logger.info("Generating Figure 5: Predicted vs observed (RF & XGBoost)")
 
     y_true_arr = np.asarray(y_true).astype(float)
     y_pred_rf = np.asarray(y_pred_rf).astype(float)
     y_pred_xgb = np.asarray(y_pred_xgb).astype(float)
+    y_pred_rf_cal = None if y_pred_rf_calibrated is None else np.asarray(y_pred_rf_calibrated).astype(float)
+    y_pred_xgb_cal = None if y_pred_xgb_calibrated is None else np.asarray(y_pred_xgb_calibrated).astype(float)
 
     w = None
     if sample_weight is not None:
@@ -837,13 +846,18 @@ def generate_figure5_predictions(
         w_sum = w.sum()
         w = (w / w_sum) if w_sum > 0 else None
 
-    all_vals = np.concatenate([y_true_arr, y_pred_rf, y_pred_xgb])
-    min_val = float(np.nanmin(all_vals))
-    max_val = float(np.nanmax(all_vals))
+    all_vals = [y_true_arr, y_pred_rf, y_pred_xgb]
+    if y_pred_rf_cal is not None:
+        all_vals.append(y_pred_rf_cal)
+    if y_pred_xgb_cal is not None:
+        all_vals.append(y_pred_xgb_cal)
+    all_concat = np.concatenate(all_vals)
+    min_val = float(np.nanmin(all_concat))
+    max_val = float(np.nanmax(all_concat))
     padding = 0.5
     lims = [max(min_val - padding, 0.0), max_val + padding]
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7), sharex=True, sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7), sharex=True, sharey=True)
 
     def _weighted_r2(y_t: np.ndarray, y_p: np.ndarray, w_: np.ndarray) -> float:
         y_bar = np.average(y_t, weights=w_)
@@ -854,77 +868,76 @@ def generate_figure5_predictions(
     def _weighted_rmse(y_t: np.ndarray, y_p: np.ndarray, w_: np.ndarray) -> float:
         return float(np.sqrt(np.average((y_t - y_p) ** 2, weights=w_)))
 
-    def _calibration(y_t: np.ndarray, y_p: np.ndarray, w_: Optional[np.ndarray]) -> Tuple[float, float]:
-        mask = np.isfinite(y_t) & np.isfinite(y_p)
-        if w_ is not None:
-            mask = mask & np.isfinite(w_) & (w_ > 0)
-        if mask.sum() < 3:
-            return (np.nan, np.nan)
-        if w_ is None:
-            a, b = np.polyfit(y_t[mask], y_p[mask], 1)
-        else:
-            a, b = np.polyfit(y_t[mask], y_p[mask], 1, w=w_[mask])
-        return float(a), float(b)
+    def _annotation_block(label: str, preds: np.ndarray) -> List[str]:
+        r2_val = r2_score(y_true_arr, preds)
+        rmse_val = np.sqrt(mean_squared_error(y_true_arr, preds))
+        intercept, slope = compute_slope_intercept(y_true_arr, preds, sample_weight=None)
+        lines_local = [
+            f"{label}: R²={r2_val:.3f}",
+            f"{label}: RMSE={rmse_val:.2f}",
+            f"{label}: slope={slope:.2f}, intercept={intercept:.2f}",
+        ]
+        if w is not None:
+            r2_w = _weighted_r2(y_true_arr, preds, w)
+            rmse_w = _weighted_rmse(y_true_arr, preds, w)
+            intercept_w, slope_w = compute_slope_intercept(y_true_arr, preds, sample_weight=w)
+            lines_local += [
+                f"{label}: R²_w={r2_w:.3f}",
+                f"{label}: RMSE_w={rmse_w:.2f}",
+                f"{label}: slope_w={slope_w:.2f}, intercept_w={intercept_w:.2f}",
+            ]
+        return lines_local
 
-    def _plot(ax, y_pred: np.ndarray, title: str):
-        if groups is not None:
-            groups_local = groups.reindex(y_true.index)
-            for g in groups_local.dropna().unique():
-                mask_g = (groups_local == g).values
-                ax.scatter(
-                    y_true_arr[mask_g],
-                    y_pred[mask_g],
-                    alpha=0.45,
-                    s=18,
-                    label=str(g),
-                )
-        else:
-            ax.scatter(y_true_arr, y_pred, alpha=0.45, s=18)
+    def _plot(ax, y_pred_base: np.ndarray, y_pred_cal: Optional[np.ndarray], title: str):
+        variants: List[Tuple[str, np.ndarray, dict]] = [
+            ("Base", y_pred_base, {"marker": "o", "alpha": 0.35, "s": 18}),
+        ]
+        if y_pred_cal is not None:
+            variants.append(("Calibrated", y_pred_cal, {"marker": "x", "alpha": 0.55, "s": 28}))
+
+        legend_items = []
+        for label, preds, style in variants:
+            if groups is not None:
+                groups_local = groups.reindex(y_true.index)
+                for g in groups_local.dropna().unique():
+                    mask_g = (groups_local == g).values
+                    sc = ax.scatter(
+                        y_true_arr[mask_g],
+                        preds[mask_g],
+                        label=f"{label}-{g}",
+                        **style,
+                    )
+                    legend_items.append(sc)
+            else:
+                sc = ax.scatter(y_true_arr, preds, label=label, **style)
+                legend_items.append(sc)
 
         ax.plot(lims, lims, "k--", alpha=0.75, zorder=0, linewidth=2)
         ax.set_xlim(lims)
         ax.set_ylim(lims)
 
-        r2 = r2_score(y_true_arr, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_true_arr, y_pred))
-        a, b = _calibration(y_true_arr, y_pred, None)
-
-        lines = [
-            f"R² = {r2:.3f}",
-            f"RMSE = {rmse:.2f}",
-            f"slope = {a:.2f}, intercept = {b:.2f}",
-        ]
-
-        if w is not None:
-            r2_w = _weighted_r2(y_true_arr, y_pred, w)
-            rmse_w = _weighted_rmse(y_true_arr, y_pred, w)
-            a_w, b_w = _calibration(y_true_arr, y_pred, w)
-            lines += [
-                f"R²_w = {r2_w:.3f}",
-                f"RMSE_w = {rmse_w:.2f}",
-                f"slope_w = {a_w:.2f}, intercept_w = {b_w:.2f}",
-            ]
+        lines: List[str] = []
+        for label, preds, _ in variants:
+            lines.extend(_annotation_block(label, preds))
 
         ax.annotate(
             "\n".join(lines),
-            xy=(0.05, 0.95),
+            xy=(0.02, 0.98),
             xycoords="axes fraction",
             fontsize=10,
             verticalalignment="top",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.88),
         )
 
         ax.set_xlabel("Observed thermal intensity, I (BTU/ft²·HDD)", fontsize=12)
         ax.set_ylabel("Predicted thermal intensity, I (BTU/ft²·HDD)", fontsize=12)
         ax.set_title(title, fontsize=14)
 
-    _plot(axes[0], y_pred_rf, "(a) Random Forest model")
-    _plot(axes[1], y_pred_xgb, "(b) XGBoost model")
+        if legend_items:
+            ax.legend(fontsize=9, frameon=True, loc="lower right")
 
-    if groups is not None:
-        handles, labels = axes[0].get_legend_handles_labels()
-        if handles:
-            axes[0].legend(handles, labels, title=group_name, fontsize=9, title_fontsize=10, frameon=True, loc="lower right")
+    _plot(axes[0], y_pred_rf, y_pred_rf_cal, "(a) Random Forest model")
+    _plot(axes[1], y_pred_xgb, y_pred_xgb_cal, "(b) XGBoost model")
 
     plt.tight_layout()
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
@@ -1446,7 +1459,6 @@ def run_modeling_pipeline(target_transform: str = "none"):
     y_pred_test_rf = rf_preds["test"]
     y_pred_test_xgb = xgb_preds["test"]
     groups = df_test["division_name"] if "division_name" in df_test.columns else None
-    generate_figure5_predictions(y_test, y_pred_test_rf, y_pred_test_xgb, groups, sample_weight=w_test)
 
     # ----------------------------
     # Post-hoc calibration (fit on validation predictions)
@@ -1459,6 +1471,16 @@ def run_modeling_pipeline(target_transform: str = "none"):
     # Apply calibration to test preds
     ypred_test_rf_uncal = y_pred_test_rf
     ypred_test_rf_cal = apply_calibration(ypred_test_rf_uncal, a_cal, b_cal)
+
+    # Figure 5 (overlay calibrated predictions when available)
+    generate_figure5_predictions(
+        y_test,
+        y_pred_test_rf,
+        y_pred_test_xgb,
+        groups,
+        sample_weight=w_test,
+        y_pred_rf_calibrated=ypred_test_rf_cal,
+    )
 
     # Compute slope/intercept on test before/after calibration (regress y_test ~ y_pred)
     a_before, b_before = compute_slope_intercept(y_test.values, ypred_test_rf_uncal)
