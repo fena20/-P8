@@ -25,6 +25,7 @@ import xgboost as xgb
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression
+from sklearn.isotonic import IsotonicRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split, StratifiedKFold
@@ -748,7 +749,9 @@ def evaluate_by_subgroups(
 # ----------------------------
 # Calibration: fit on validation, apply on test
 # ----------------------------
-def fit_posthoc_calibration(y_val: np.ndarray, yval_pred: np.ndarray) -> Tuple[float, float]:
+def fit_posthoc_calibration_linear(
+    y_val: np.ndarray, yval_pred: np.ndarray, sample_weight: Optional[np.ndarray] = None
+) -> Tuple[float, float]:
     """
     Fit linear regression: y_val = a + b * yval_pred
     Return (a, b)
@@ -756,11 +759,21 @@ def fit_posthoc_calibration(y_val: np.ndarray, yval_pred: np.ndarray) -> Tuple[f
     lr = LinearRegression()
     X = np.asarray(yval_pred).reshape(-1, 1)
     y = np.asarray(y_val).reshape(-1, 1)
-    lr.fit(X, y)
+    lr.fit(X, y, sample_weight=sample_weight)
     a = float(lr.intercept_.ravel()[0])
     b = float(lr.coef_.ravel()[0])
-    logger.info(f"Calibration fitted on validation: intercept(a)={a:.4f}, slope(b)={b:.4f}")
+    logger.info(f"Calibration fitted on validation (linear): intercept(a)={a:.4f}, slope(b)={b:.4f}")
     return a, b
+
+
+def fit_posthoc_calibration_isotonic(
+    y_val: np.ndarray, yval_pred: np.ndarray, sample_weight: Optional[np.ndarray] = None
+) -> IsotonicRegression:
+    """Fit an isotonic regression y_val ~ y_pred (monotonic, non-linear)."""
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(np.asarray(yval_pred), np.asarray(y_val), sample_weight=sample_weight)
+    logger.info("Calibration fitted on validation (isotonic, monotonic).")
+    return iso
 
 
 def apply_calibration(y_pred: np.ndarray, a: float, b: float) -> np.ndarray:
@@ -775,14 +788,29 @@ def calibrate_predictions(
     y_test_pred: np.ndarray,
     sample_weight_val: Optional[np.ndarray] = None,
     sample_weight_test: Optional[np.ndarray] = None,
+    mode: str = "isotonic",
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
-    Fit linear post-hoc calibration on validation predictions and apply to test predictions.
+    Fit post-hoc calibration on validation predictions and apply to test predictions.
 
     Returns calibrated test predictions and a summary dictionary (before/after slopes, bias, RMSE/MAE/MAPE).
     """
-    a_cal, b_cal = fit_posthoc_calibration(y_val.values, y_val_pred)
-    y_test_cal = apply_calibration(y_test_pred, a_cal, b_cal)
+    mode = mode.lower()
+    if mode not in {"linear", "isotonic"}:
+        raise ValueError("calibration mode must be 'linear' or 'isotonic'")
+
+    if mode == "linear":
+        a_cal, b_cal = fit_posthoc_calibration_linear(y_val.values, y_val_pred, sample_weight=sample_weight_val)
+        y_test_cal = apply_calibration(y_test_pred, a_cal, b_cal)
+        calib_desc = {"mode": "linear", "a": a_cal, "b": b_cal}
+    else:
+        iso = fit_posthoc_calibration_isotonic(y_val.values, y_val_pred, sample_weight=sample_weight_val)
+        y_test_cal = iso.predict(np.asarray(y_test_pred))
+        calib_desc = {
+            "mode": "isotonic",
+            "iso_min_x": float(np.min(iso.X_thresholds_)),
+            "iso_max_x": float(np.max(iso.X_thresholds_)),
+        }
 
     cal_before = calibration_line_stats(y_test.values, y_test_pred, sample_weight=sample_weight_test)
     cal_after = calibration_line_stats(y_test.values, y_test_cal, sample_weight=sample_weight_test)
@@ -790,9 +818,12 @@ def calibrate_predictions(
     metrics_uncal = evaluate_predictions(y_test.values, y_test_pred, sample_weight=sample_weight_test)
     metrics_cal = evaluate_predictions(y_test.values, y_test_cal, sample_weight=sample_weight_test)
 
-    logger.info(
-        f"Calibration ({model_name}) fitted on validation: intercept(a)={a_cal:.4f}, slope(b)={b_cal:.4f}."
-    )
+    if mode == "linear":
+        logger.info(
+            f"Calibration ({model_name}, linear) fitted on validation: intercept(a)={a_cal:.4f}, slope(b)={b_cal:.4f}."
+        )
+    else:
+        logger.info(f"Calibration ({model_name}, isotonic) fitted on validation.")
     logger.info(
         f"{model_name} Test (obs~pred): before slope={cal_before['slope_obs_on_pred']:.4f}, "
         f"intercept={cal_before['intercept_obs_on_pred']:.4f}, bias_mean={metrics_uncal['bias_mean']:.4f}" \
@@ -802,8 +833,7 @@ def calibrate_predictions(
 
     summary = {
         "model": model_name,
-        "calib_intercept_val_a": a_cal,
-        "calib_slope_val_b": b_cal,
+        "calibration_mode": mode,
         "test_slope_before": cal_before["slope_obs_on_pred"],
         "test_intercept_before": cal_before["intercept_obs_on_pred"],
         "test_slope_after": cal_after["slope_obs_on_pred"],
@@ -817,6 +847,14 @@ def calibrate_predictions(
         "MAPE_before": metrics_uncal["mape"],
         "MAPE_after": metrics_cal["mape"],
     }
+
+    if mode == "linear":
+        summary.update({
+            "calib_intercept_val_a": a_cal,
+            "calib_slope_val_b": b_cal,
+        })
+    else:
+        summary.update(calib_desc)
 
     return y_test_cal, summary
 
@@ -1511,6 +1549,7 @@ def run_modeling_pipeline(
     xgb_objective: str = "reg:squarederror",
     figure5_plot_style: str = "hexbin",
     target_definition: str = "intensity",
+    calibration_mode: str = "isotonic",
 ):
     """
     target_transform: "none" | "log1p" | "yeo"
@@ -1526,6 +1565,7 @@ def run_modeling_pipeline(
     logger.info(f"Target transform: {target_transform}")
     logger.info(f"XGBoost objective: {xgb_objective}")
     logger.info(f"Target definition: {target_definition}")
+    logger.info(f"Calibration mode: {calibration_mode}")
 
     df = load_processed_data()
     if min_hdd65 is not None:
@@ -1656,6 +1696,7 @@ def run_modeling_pipeline(
         y_pred_test_rf,
         sample_weight_val=w_val,
         sample_weight_test=w_test,
+        mode=calibration_mode,
     )
     xgb_calibrated_test, xgb_calib_summary = calibrate_predictions(
         "XGBoost",
@@ -1665,6 +1706,7 @@ def run_modeling_pipeline(
         y_pred_test_xgb,
         sample_weight_val=w_val,
         sample_weight_test=w_test,
+        mode=calibration_mode,
     )
 
     # Figure 5 (overlay calibrated predictions when available)
