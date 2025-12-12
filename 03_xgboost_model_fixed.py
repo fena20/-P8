@@ -40,9 +40,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------
-# Paths
+# Paths (resolve relative to this script to avoid missing-data errors)
 # ----------------------------
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 FIGURES_DIR = OUTPUT_DIR / "figures"
@@ -147,10 +147,17 @@ class PreprocessedRegressor:
 # Data loading & features
 # ----------------------------
 def load_processed_data() -> pd.DataFrame:
-    filepath = OUTPUT_DIR / "03_gas_heated_clean.csv"
-    if not filepath.exists():
+    candidate_paths = [
+        PROJECT_ROOT / "03_gas_heated_clean.csv",
+        DATA_DIR / "03_gas_heated_clean.csv",
+        OUTPUT_DIR / "03_gas_heated_clean.csv",
+    ]
+    filepath = next((p for p in candidate_paths if p.exists()), None)
+    if filepath is None:
+        searched = ", ".join(str(p) for p in candidate_paths)
         raise FileNotFoundError(
-            f"Processed data not found at {filepath}. Run 01_data_prep.py first."
+            "Processed data file '03_gas_heated_clean.csv' not found. "
+            f"Searched in: {searched}. Run 01_data_prep.py first or place the file accordingly."
         )
     df = pd.read_csv(filepath)
     logger.info(f"Loaded {len(df):,} rows from {filepath}")
