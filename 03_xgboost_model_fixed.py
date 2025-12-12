@@ -12,7 +12,7 @@ import os
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Any
 
 import joblib
 import numpy as np
@@ -79,6 +79,15 @@ class TargetTransformer:
         self._pt = None  # for yeo
         self.fitted = False
 
+    def clone(self) -> "TargetTransformer":
+        """Return a shallow copy preserving the fitted PowerTransformer if present."""
+        new = TargetTransformer(kind=self.kind)
+        new.fitted = self.fitted
+        if self._pt is not None:
+            # PowerTransformer is picklable; copy state directly
+            new._pt = joblib.loads(joblib.dumps(self._pt))
+        return new
+
     def fit(self, y: np.ndarray):
         y = np.asarray(y).reshape(-1, 1).astype(float)
         if self.kind == "yeo":
@@ -115,14 +124,23 @@ class PreprocessedRegressor:
     preprocessor: ColumnTransformer  # must be already fit
     model: Any  # estimator (fit on transformed target)
     feature_names_: List[str]
-    y_inverse_fn: Callable[[np.ndarray], np.ndarray]  # function to inverse-transform model outputs
+    target_transformer: TargetTransformer  # keeps forward + inverse transform of y
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         Xt = self.preprocessor.transform(X)
         yp = self.model.predict(Xt)
         # ensure shape is (n,)
         yp = np.asarray(yp).ravel()
-        return self.y_inverse_fn(yp)
+        return self.target_transformer.inverse_transform(yp)
+
+    def predict_transformed(self, X: pd.DataFrame) -> np.ndarray:
+        """Predict in the transformed target space (no inverse applied)."""
+        Xt = self.preprocessor.transform(X)
+        yp = self.model.predict(Xt)
+        return np.asarray(yp).ravel()
+
+    def transform_y(self, y: np.ndarray) -> np.ndarray:
+        return self.target_transformer.transform(y)
 
 
 # ----------------------------
@@ -393,6 +411,88 @@ def evaluate_model(
 
 
 # ----------------------------
+# Target-transform-aware corrections and diagnostics
+# ----------------------------
+def compute_slope_intercept(
+    y_true: np.ndarray, y_pred: np.ndarray, sample_weight: Optional[np.ndarray] = None
+) -> Tuple[float, float]:
+    """Return (intercept, slope) from regressing y_true on y_pred."""
+    lr = LinearRegression()
+    lr.fit(np.asarray(y_pred).reshape(-1, 1), np.asarray(y_true), sample_weight=sample_weight)
+    return float(lr.intercept_.ravel()[0]), float(lr.coef_.ravel()[0])
+
+
+def bias_by_decile(
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+    n_deciles: int = 10,
+) -> pd.DataFrame:
+    """Compute bias (observed - predicted) per decile of observed values."""
+    df_tmp = pd.DataFrame({"y_true": y_true.values, "y_pred": np.asarray(y_pred).ravel()})
+    df_tmp = df_tmp.assign(decile=pd.qcut(df_tmp["y_true"], q=n_deciles, labels=False, duplicates="drop") + 1)
+
+    out_rows = []
+    for d in sorted(df_tmp["decile"].dropna().unique()):
+        mask = df_tmp["decile"] == d
+        if sample_weight is None:
+            bias = (df_tmp.loc[mask, "y_true"] - df_tmp.loc[mask, "y_pred"]).mean()
+            n = mask.sum()
+        else:
+            w = np.asarray(sample_weight)[mask.values]
+            bias = np.average(
+                df_tmp.loc[mask, "y_true"] - df_tmp.loc[mask, "y_pred"],
+                weights=w,
+            )
+            n = float(np.sum(w))
+        out_rows.append({"decile": int(d), "bias_mean": float(bias), "n_samples": float(n)})
+
+    return pd.DataFrame(out_rows)
+
+
+def upper_decile_bias(decile_df: pd.DataFrame, top_k: int = 2) -> float:
+    if decile_df.empty:
+        return np.nan
+    top = decile_df.sort_values("decile").tail(top_k)
+    weights = top["n_samples"].values
+    weights = weights / weights.sum() if weights.sum() > 0 else None
+    if weights is None:
+        return float(top["bias_mean"].mean())
+    return float(np.average(top["bias_mean"], weights=weights))
+
+
+def compute_duan_smearing(y_true_trans: np.ndarray, y_pred_trans: np.ndarray) -> Tuple[float, float]:
+    """Compute Duan smearing factor (mean exp residual) and its std on training data."""
+    resid = np.asarray(y_true_trans).ravel() - np.asarray(y_pred_trans).ravel()
+    smear_terms = np.exp(resid)
+    return float(np.mean(smear_terms)), float(np.std(smear_terms, ddof=1) if len(smear_terms) > 1 else 0.0)
+
+
+def apply_duan_smearing(y_pred_trans: np.ndarray, smearing_factor: float) -> np.ndarray:
+    """Apply Duan smearing to log1p predictions and return in original units."""
+    return np.exp(np.asarray(y_pred_trans).ravel()) * float(smearing_factor) - 1.0
+
+
+def empirical_corrections(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float]:
+    """Return additive and multiplicative corrections based on training residuals."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    add_corr = float(np.mean(y_true - y_pred))
+    denom = np.where(np.abs(y_pred) < 1e-8, 1e-8, y_pred)
+    mult_corr = float(np.mean(y_true / denom))
+    return add_corr, mult_corr
+
+
+def apply_empirical_correction(y_pred: np.ndarray, add_corr: float, mult_corr: float, mode: str) -> np.ndarray:
+    mode = mode.lower()
+    if mode == "additive":
+        return np.asarray(y_pred, dtype=float) + float(add_corr)
+    if mode == "multiplicative":
+        return np.asarray(y_pred, dtype=float) * float(mult_corr)
+    raise ValueError("mode must be 'additive' or 'multiplicative'")
+
+
+# ----------------------------
 # Training helpers (fit preprocessor + model on transformed targets, return PreprocessedRegressor)
 # ----------------------------
 def train_ols(
@@ -406,8 +506,9 @@ def train_ols(
     preprocessor.fit(X_train)
     Xtr = preprocessor.transform(X_train)
     # transform target
-    target_transformer.fit(y_train.values)
-    ytr = target_transformer.transform(y_train.values)
+    tgt = target_transformer.clone()
+    tgt.fit(y_train.values)
+    ytr = tgt.transform(y_train.values)
 
     model = LinearRegression()
     if sample_weight is not None:
@@ -416,7 +517,7 @@ def train_ols(
         model.fit(Xtr, ytr)
 
     feature_names = get_feature_names(preprocessor)
-    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, y_inverse_fn=target_transformer.inverse_transform)
+    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, target_transformer=tgt)
 
 
 def train_random_forest(
@@ -441,8 +542,9 @@ def train_random_forest(
 
     preprocessor.fit(X_train)
     Xtr = preprocessor.transform(X_train)
-    target_transformer.fit(y_train.values)
-    ytr = target_transformer.transform(y_train.values)
+    tgt = target_transformer.clone()
+    tgt.fit(y_train.values)
+    ytr = tgt.transform(y_train.values)
 
     model = RandomForestRegressor(**default)
     if sample_weight is not None:
@@ -451,7 +553,7 @@ def train_random_forest(
         model.fit(Xtr, ytr)
 
     feature_names = get_feature_names(preprocessor)
-    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, y_inverse_fn=target_transformer.inverse_transform)
+    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, target_transformer=tgt)
 
 
 def train_xgboost(
@@ -488,9 +590,10 @@ def train_xgboost(
     Xva = preprocessor.transform(X_val)
 
     # target transform
-    target_transformer.fit(y_train.values)
-    ytr = target_transformer.transform(y_train.values)
-    yva = target_transformer.transform(y_val.values)
+    tgt = target_transformer.clone()
+    tgt.fit(y_train.values)
+    ytr = tgt.transform(y_train.values)
+    yva = tgt.transform(y_val.values)
 
     feature_names = get_feature_names(preprocessor)
 
@@ -527,7 +630,7 @@ def train_xgboost(
             model.fit(Xtr, ytr)
         logger.warning(f"XGBoost early stopping failed ({e}); trained with fixed n_estimators=400.")
 
-    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, y_inverse_fn=target_transformer.inverse_transform)
+    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, target_transformer=tgt)
 
 
 # ----------------------------
@@ -947,6 +1050,223 @@ def cross_validate_xgb(
 
 
 # ----------------------------
+# Target transform comparison (log1p vs Yeo–Johnson vs none)
+# ----------------------------
+def _train_model_for_kind(
+    model_type: str,
+    transform_kind: str,
+    num_cols: List[str],
+    cat_cols: List[str],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    sample_weight_train: Optional[np.ndarray],
+    sample_weight_val: Optional[np.ndarray],
+) -> PreprocessedRegressor:
+    pre = build_preprocessor(num_cols, cat_cols)
+    tgt = TargetTransformer(kind=transform_kind)
+    if model_type == "rf":
+        return train_random_forest(pre, X_train, y_train, tgt, sample_weight=sample_weight_train)
+    if model_type == "xgb":
+        return train_xgboost(
+            pre,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            tgt,
+            sample_weight=sample_weight_train,
+            sample_weight_val=sample_weight_val,
+        )
+    raise ValueError("model_type must be 'rf' or 'xgb'")
+
+
+def _metric_row(
+    transform_kind: str,
+    model_label: str,
+    stage: str,
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+    sample_weight: Optional[np.ndarray],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    metrics = evaluate_predictions(y_true.values, y_pred, sample_weight=sample_weight)
+    intercept, slope = compute_slope_intercept(y_true.values, y_pred, sample_weight=sample_weight)
+    deciles = bias_by_decile(y_true, y_pred, sample_weight=sample_weight)
+    row = {
+        "transform": transform_kind,
+        "model": model_label,
+        "stage": stage,
+        "n_samples": metrics.get("n_samples"),
+        "rmse": metrics.get("rmse"),
+        "mae": metrics.get("mae"),
+        "r2": metrics.get("r2"),
+        "mape": metrics.get("mape"),
+        "weighted_rmse": metrics.get("weighted_rmse"),
+        "weighted_mae": metrics.get("weighted_mae"),
+        "weighted_r2": metrics.get("weighted_r2"),
+        "weighted_mape": metrics.get("weighted_mape"),
+        "bias_mean": metrics.get("bias_mean"),
+        "bias_abs_mean": metrics.get("bias_abs_mean"),
+        "slope": slope,
+        "intercept": intercept,
+        "bias_top_deciles": upper_decile_bias(deciles),
+    }
+    if extra:
+        row.update(extra)
+    deciles = deciles.assign(transform=transform_kind, model=model_label, stage=stage)
+    return row, deciles
+
+
+def evaluate_transform_strategy(
+    transform_kind: str,
+    model_type: str,
+    num_cols: List[str],
+    cat_cols: List[str],
+    splits: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series],
+    weights: Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    (
+        X_train,
+        X_val,
+        X_test,
+        y_train,
+        y_val,
+        y_test,
+    ) = splits
+    w_train, w_val, w_test = weights
+
+    model = _train_model_for_kind(
+        model_type,
+        transform_kind,
+        num_cols,
+        cat_cols,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        w_train,
+        w_val,
+    )
+
+    model_label = "RandomForest" if model_type == "rf" else "XGBoost"
+
+    rows: List[Dict[str, Any]] = []
+    decile_rows: List[Dict[str, Any]] = []
+
+    # Base predictions (already inverse-transformed by model.predict)
+    base_preds_train = model.predict(X_train)
+    base_preds_val = model.predict(X_val)
+    base_preds_test = model.predict(X_test)
+
+    row_base, dec_base = _metric_row(transform_kind, model_label, "base", y_test, base_preds_test, w_test)
+    rows.append(row_base)
+    decile_rows.extend(dec_base.to_dict(orient="records"))
+
+    if transform_kind == "log1p":
+        y_true_tr = model.transform_y(y_train.values)
+        y_pred_tr = model.predict_transformed(X_train)
+        smear_factor, smear_std = compute_duan_smearing(y_true_tr, y_pred_tr)
+
+        preds_test_smear = apply_duan_smearing(model.predict_transformed(X_test), smear_factor)
+        row_smear, dec_smear = _metric_row(
+            transform_kind,
+            model_label,
+            "duan_smear",
+            y_test,
+            preds_test_smear,
+            w_test,
+            extra={"duan_smear": smear_factor, "duan_smear_std": smear_std},
+        )
+        rows.append(row_smear)
+        decile_rows.extend(dec_smear.to_dict(orient="records"))
+    elif transform_kind == "yeo":
+        add_corr, mult_corr = empirical_corrections(y_train.values, base_preds_train)
+
+        val_add = apply_empirical_correction(base_preds_val, add_corr, mult_corr, mode="additive")
+        val_mult = apply_empirical_correction(base_preds_val, add_corr, mult_corr, mode="multiplicative")
+
+        _, dec_add = _metric_row(transform_kind, model_label, "yeo_val_additive", y_val, val_add, w_val)
+        _, dec_mult = _metric_row(transform_kind, model_label, "yeo_val_multiplicative", y_val, val_mult, w_val)
+
+        bias_add = abs(upper_decile_bias(dec_add))
+        bias_mult = abs(upper_decile_bias(dec_mult))
+
+        if bias_add <= bias_mult:
+            chosen_mode = "additive"
+        else:
+            chosen_mode = "multiplicative"
+
+        preds_test_corrected = apply_empirical_correction(
+            base_preds_test, add_corr, mult_corr, mode=chosen_mode
+        )
+        row_corr, dec_corr = _metric_row(
+            transform_kind,
+            model_label,
+            f"yeo_corrected_{chosen_mode}",
+            y_test,
+            preds_test_corrected,
+            w_test,
+            extra={"add_corr": add_corr, "mult_corr": mult_corr, "chosen_mode": chosen_mode},
+        )
+        rows.append(row_corr)
+        decile_rows.extend(dec_corr.to_dict(orient="records"))
+
+    return rows, decile_rows
+
+
+def compare_target_transformations() -> Dict[str, pd.DataFrame]:
+    logger.info("Running target transform comparison (none vs log1p vs yeo)")
+    df = load_processed_data()
+    X, y = prepare_X_y(df)
+    num_cols, cat_cols = get_feature_lists(df)
+
+    (
+        X_train,
+        X_val,
+        X_test,
+        y_train,
+        y_val,
+        y_test,
+        w_train,
+        w_val,
+        w_test,
+        _,
+        _,
+        _
+    ) = split_data(X, y, df, stratify_col="REGIONC")
+
+    splits = (X_train, X_val, X_test, y_train, y_val, y_test)
+    weights = (w_train, w_val, w_test)
+
+    all_rows: List[Dict[str, Any]] = []
+    decile_rows: List[Dict[str, Any]] = []
+
+    for transform_kind in ["none", "log1p", "yeo"]:
+        for model_type in ["rf", "xgb"]:
+            rows, decs = evaluate_transform_strategy(
+                transform_kind,
+                model_type,
+                num_cols,
+                cat_cols,
+                splits,
+                weights,
+            )
+            all_rows.extend(rows)
+            decile_rows.extend(decs)
+
+    summary_df = pd.DataFrame(all_rows)
+    deciles_df = pd.DataFrame(decile_rows)
+
+    TABLES_DIR.mkdir(parents=True, exist_ok=True)
+    summary_df.to_csv(TABLES_DIR / "target_transform_comparison_summary.csv", index=False)
+    deciles_df.to_csv(TABLES_DIR / "target_transform_decile_biases.csv", index=False)
+
+    return {"summary": summary_df, "deciles": deciles_df}
+
+
+# ----------------------------
 # Main pipeline (with new options)
 # ----------------------------
 def run_modeling_pipeline(target_transform: str = "none"):
@@ -1035,13 +1355,6 @@ def run_modeling_pipeline(target_transform: str = "none"):
     ypred_test_rf_cal = apply_calibration(ypred_test_rf_uncal, a_cal, b_cal)
 
     # Compute slope/intercept on test before/after calibration (regress y_test ~ y_pred)
-    def compute_slope_intercept(y_true_arr, y_pred_arr):
-        lr = LinearRegression()
-        lr.fit(np.asarray(y_pred_arr).reshape(-1, 1), np.asarray(y_true_arr).reshape(-1, 1))
-        a = float(lr.intercept_.ravel()[0])
-        b = float(lr.coef_.ravel()[0])
-        return a, b
-
     a_before, b_before = compute_slope_intercept(y_test.values, ypred_test_rf_uncal)
     a_after, b_after = compute_slope_intercept(y_test.values, ypred_test_rf_cal)
 
