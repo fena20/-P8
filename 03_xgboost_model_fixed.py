@@ -591,6 +591,7 @@ def train_xgboost(
     sample_weight: Optional[np.ndarray] = None,
     sample_weight_val: Optional[np.ndarray] = None,
     params: Optional[dict] = None,
+    objective: str = "reg:squarederror",
 ) -> PreprocessedRegressor:
     base_params = dict(
         n_estimators=2000,          # with early stopping this is safe
@@ -604,7 +605,7 @@ def train_xgboost(
         reg_lambda=1.0,
         random_state=42,
         n_jobs=-1,
-        objective="reg:squarederror",
+        objective=objective,
     )
     if params:
         base_params.update(params)
@@ -892,6 +893,7 @@ def generate_figure5_predictions(
     sample_weight: Optional[np.ndarray] = None,
     y_pred_rf_calibrated: Optional[np.ndarray] = None,
     y_pred_xgb_calibrated: Optional[np.ndarray] = None,
+    plot_style: str = "hexbin",
 ):
     """
     Plot predicted vs observed for RF and XGB, optionally overlaying calibrated predictions.
@@ -987,6 +989,20 @@ def generate_figure5_predictions(
                     )
                     if legend_label is not None and legend_label not in group_handles:
                         group_handles[legend_label] = sc
+            elif plot_style.lower() == "hexbin":
+                cmap = "Blues" if label == "Base" else "Oranges"
+                hb = ax.hexbin(
+                    y_true_arr,
+                    preds,
+                    gridsize=55,
+                    cmap=cmap,
+                    mincnt=1,
+                    alpha=0.55 if label == "Base" else 0.75,
+                    linewidths=0.25,
+                    bins="log",
+                )
+                if label == "Base":
+                    group_handles["Base density"] = hb
             else:
                 ax.scatter(y_true_arr, preds, label=label, **style)
 
@@ -1016,11 +1032,15 @@ def generate_figure5_predictions(
             labels = list(group_handles.keys())
             ax.legend(handles, labels, title=group_name, fontsize=9, title_fontsize=10, frameon=True, loc="lower right")
         elif groups_local is None:
-            variant_handles = [
-                Line2D([0], [0], marker="o", linestyle="", color="gray", alpha=0.5, label="Base"),
-            ]
-            if y_pred_cal is not None:
-                variant_handles.append(Line2D([0], [0], marker="x", linestyle="", color="gray", alpha=0.8, label="Calibrated"))
+            variant_handles = []
+            if plot_style.lower() == "hexbin":
+                variant_handles.append(Line2D([0], [0], marker="s", linestyle="", color="steelblue", alpha=0.6, label="Base density"))
+                if y_pred_cal is not None:
+                    variant_handles.append(Line2D([0], [0], marker="s", linestyle="", color="darkorange", alpha=0.7, label="Calibrated density"))
+            else:
+                variant_handles.append(Line2D([0], [0], marker="o", linestyle="", color="gray", alpha=0.5, label="Base"))
+                if y_pred_cal is not None:
+                    variant_handles.append(Line2D([0], [0], marker="x", linestyle="", color="gray", alpha=0.8, label="Calibrated"))
             ax.legend(handles=variant_handles, fontsize=9, frameon=True, loc="lower right")
 
     _plot(axes[0], y_pred_rf, y_pred_rf_cal, "(a) Random Forest model")
@@ -1174,6 +1194,7 @@ def _train_model_for_kind(
     y_val: pd.Series,
     sample_weight_train: Optional[np.ndarray],
     sample_weight_val: Optional[np.ndarray],
+    xgb_objective: str = "reg:squarederror",
 ) -> PreprocessedRegressor:
     pre = build_preprocessor(num_cols, cat_cols)
     tgt = TargetTransformer(kind=transform_kind)
@@ -1189,6 +1210,7 @@ def _train_model_for_kind(
             tgt,
             sample_weight=sample_weight_train,
             sample_weight_val=sample_weight_val,
+            objective=xgb_objective,
         )
     raise ValueError("model_type must be 'rf' or 'xgb'")
 
@@ -1239,6 +1261,7 @@ def evaluate_transform_strategy(
     cat_cols: List[str],
     splits: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series],
     weights: Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]],
+    xgb_objective: str = "reg:squarederror",
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     (
         X_train,
@@ -1261,6 +1284,7 @@ def evaluate_transform_strategy(
         y_val,
         w_train,
         w_val,
+        xgb_objective,
     )
 
     model_label = "RandomForest" if model_type == "rf" else "XGBoost"
@@ -1392,7 +1416,7 @@ def corrected_predictions_for_model(
     return base_preds, corrected, info
 
 
-def compare_target_transformations() -> Dict[str, pd.DataFrame]:
+def compare_target_transformations(xgb_objective: str = "reg:squarederror") -> Dict[str, pd.DataFrame]:
     logger.info("Running target transform comparison (none vs log1p vs yeo)")
     df = load_processed_data()
     X, y = prepare_X_y(df)
@@ -1428,6 +1452,7 @@ def compare_target_transformations() -> Dict[str, pd.DataFrame]:
                 cat_cols,
                 splits,
                 weights,
+                xgb_objective=xgb_objective,
             )
             all_rows.extend(rows)
             decile_rows.extend(decs)
@@ -1445,17 +1470,39 @@ def compare_target_transformations() -> Dict[str, pd.DataFrame]:
 # ----------------------------
 # Main pipeline (with new options)
 # ----------------------------
-def run_modeling_pipeline(target_transform: str = "none"):
+def run_modeling_pipeline(
+    target_transform: str = "none",
+    min_hdd65: Optional[float] = None,
+    xgb_objective: str = "reg:squarederror",
+    figure5_plot_style: str = "hexbin",
+):
     """
     target_transform: "none" | "log1p" | "yeo"
+    min_hdd65: optional floor on HDD65 to drop ultra-mild cases that destabilize I = E/(A*HDD)
+    xgb_objective: choose loss (e.g., reg:squarederror, reg:absoluteerror, reg:pseudohubererror)
+    figure5_plot_style: "scatter" or "hexbin" for pred-vs-obs chart density control
     """
     logger.info("=" * 60)
     logger.info("Thermal intensity modeling pipeline (OLS / RF / XGBoost) - extended")
     logger.info("=" * 60)
     logger.info(f"Versions: xgboost={xgb.__version__}")
     logger.info(f"Target transform: {target_transform}")
+    logger.info(f"XGBoost objective: {xgb_objective}")
 
     df = load_processed_data()
+    if min_hdd65 is not None:
+        if "HDD65" in df.columns:
+            before = len(df)
+            df = df.loc[df["HDD65"] >= float(min_hdd65)].copy()
+            after = len(df)
+            logger.info(
+                f"Applied HDD65 threshold >= {min_hdd65}. Rows kept: {after:,} of {before:,} ({after / before * 100:.1f}%)."
+            )
+            if after == 0:
+                raise ValueError("All rows filtered out by HDD65 threshold. Loosen min_hdd65 or inspect data.")
+        else:
+            logger.warning("min_hdd65 provided but 'HDD65' column not found; no filtering applied.")
+
     X, y = prepare_X_y(df)
     num_cols, cat_cols = get_feature_lists(df)
 
@@ -1484,7 +1531,17 @@ def run_modeling_pipeline(target_transform: str = "none"):
     model_rf = train_random_forest(pre_rf, X_train, y_train, tgt, sample_weight=w_train)
 
     # 3) XGBoost (benchmark)
-    model_xgb = train_xgboost(pre_xgb, X_train, y_train, X_val, y_val, tgt, sample_weight=w_train, sample_weight_val=w_val)
+    model_xgb = train_xgboost(
+        pre_xgb,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        tgt,
+        sample_weight=w_train,
+        sample_weight_val=w_val,
+        objective=xgb_objective,
+    )
 
     # Apply target-transform-aware corrections (smearing / empirical) for each model
     ols_base, ols_preds, ols_info = corrected_predictions_for_model(
@@ -1581,6 +1638,7 @@ def run_modeling_pipeline(target_transform: str = "none"):
         sample_weight=w_test,
         y_pred_rf_calibrated=rf_calibrated_test,
         y_pred_xgb_calibrated=xgb_calibrated_test,
+        plot_style=figure5_plot_style,
     )
 
     # Save calibration summaries (include target-transform corrections for context)
