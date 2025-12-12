@@ -1575,6 +1575,10 @@ def run_modeling_pipeline(target_transform: str = "none"):
     # Preserve RF-only output for backward compatibility
     calib_df[calib_df["model"] == "RandomForest"].to_csv(TABLES_DIR / "calibration_summary_rf.csv", index=False)
 
+    # Extract RF calibration params for downstream saves/returns
+    rf_a = rf_calib_summary.get("calib_intercept_val_a", np.nan)
+    rf_b = rf_calib_summary.get("calib_slope_val_b", np.nan)
+
     # Detailed error by deciles/climate/HDD (RF as primary model), include calibrated overlay
     df_error_breakdown = error_by_deciles_and_climate(y_test, y_pred_test_rf, rf_calibrated_test, df_test, sample_weight=w_test)
     df_error_breakdown.to_csv(TABLES_DIR / "error_by_decile_climate_hdd_rf.csv", index=False)
@@ -1636,7 +1640,7 @@ def run_modeling_pipeline(target_transform: str = "none"):
     joblib.dump(model_xgb, MODELS_DIR / "xgboost_thermal_intensity_calibrated.joblib")
 
     # Save calibration parameters
-    pd.DataFrame([{"a": a_cal, "b": b_cal}]).to_csv(MODELS_DIR / "rf_calibration_params.csv", index=False)
+    pd.DataFrame([{"a": rf_a, "b": rf_b}]).to_csv(MODELS_DIR / "rf_calibration_params.csv", index=False)
 
     # Feature importance (post-encoding)
     rf_est = model_rf.model
@@ -1693,7 +1697,7 @@ def run_modeling_pipeline(target_transform: str = "none"):
         "y_test": y_test,
         "y_pred_rf_uncal": ypred_test_rf_uncal,
         "y_pred_rf_cal": ypred_test_rf_cal,
-        "calibration_params": (a_cal, b_cal),
+        "calibration_params": (rf_a, rf_b),
         "error_breakdown": df_error_breakdown,
     }
 
