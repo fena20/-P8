@@ -423,10 +423,27 @@ def evaluate_model(
 def compute_slope_intercept(
     y_true: np.ndarray, y_pred: np.ndarray, sample_weight: Optional[np.ndarray] = None
 ) -> Tuple[float, float]:
-    """Return (intercept, slope) from regressing y_true on y_pred."""
+    """
+    Official definition used across the pipeline:
+    regress OBSERVED on PREDICTED and return (intercept, slope).
+    A well-calibrated model should have slope≈1 and intercept≈0 under this convention.
+    """
     lr = LinearRegression()
     lr.fit(np.asarray(y_pred).reshape(-1, 1), np.asarray(y_true), sample_weight=sample_weight)
     return float(lr.intercept_.ravel()[0]), float(lr.coef_.ravel()[0])
+
+
+def calibration_line_stats(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Convenience wrapper returning intercept/slope under the obs~pred convention."""
+    intercept, slope = compute_slope_intercept(y_true, y_pred, sample_weight=sample_weight)
+    return {
+        "intercept_obs_on_pred": intercept,
+        "slope_obs_on_pred": slope,
+    }
 
 
 def bias_by_decile(
@@ -871,20 +888,20 @@ def generate_figure5_predictions(
     def _annotation_block(label: str, preds: np.ndarray) -> List[str]:
         r2_val = r2_score(y_true_arr, preds)
         rmse_val = np.sqrt(mean_squared_error(y_true_arr, preds))
-        intercept, slope = compute_slope_intercept(y_true_arr, preds, sample_weight=None)
+        cal_stats = calibration_line_stats(y_true_arr, preds, sample_weight=None)
         lines_local = [
             f"{label}: R²={r2_val:.3f}",
             f"{label}: RMSE={rmse_val:.2f}",
-            f"{label}: slope={slope:.2f}, intercept={intercept:.2f}",
+            f"{label}: slope(obs~pred)={cal_stats['slope_obs_on_pred']:.2f}, intercept={cal_stats['intercept_obs_on_pred']:.2f}",
         ]
         if w is not None:
             r2_w = _weighted_r2(y_true_arr, preds, w)
             rmse_w = _weighted_rmse(y_true_arr, preds, w)
-            intercept_w, slope_w = compute_slope_intercept(y_true_arr, preds, sample_weight=w)
+            cal_stats_w = calibration_line_stats(y_true_arr, preds, sample_weight=w)
             lines_local += [
                 f"{label}: R²_w={r2_w:.3f}",
                 f"{label}: RMSE_w={rmse_w:.2f}",
-                f"{label}: slope_w={slope_w:.2f}, intercept_w={intercept_w:.2f}",
+                f"{label}: slope_w(obs~pred)={cal_stats_w['slope_obs_on_pred']:.2f}, intercept_w={cal_stats_w['intercept_obs_on_pred']:.2f}",
             ]
         return lines_local
 
@@ -1116,7 +1133,7 @@ def _metric_row(
     extra: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], pd.DataFrame]:
     metrics = evaluate_predictions(y_true.values, y_pred, sample_weight=sample_weight)
-    intercept, slope = compute_slope_intercept(y_true.values, y_pred, sample_weight=sample_weight)
+    cal_stats = calibration_line_stats(y_true.values, y_pred, sample_weight=sample_weight)
     deciles = bias_by_decile(y_true, y_pred, sample_weight=sample_weight)
     row = {
         "transform": transform_kind,
@@ -1133,8 +1150,10 @@ def _metric_row(
         "weighted_mape": metrics.get("weighted_mape"),
         "bias_mean": metrics.get("bias_mean"),
         "bias_abs_mean": metrics.get("bias_abs_mean"),
-        "slope": slope,
-        "intercept": intercept,
+        "slope": cal_stats["slope_obs_on_pred"],
+        "intercept": cal_stats["intercept_obs_on_pred"],
+        "slope_obs_on_pred": cal_stats["slope_obs_on_pred"],
+        "intercept_obs_on_pred": cal_stats["intercept_obs_on_pred"],
         "bias_top_deciles": upper_decile_bias(deciles),
     }
     if extra:
@@ -1482,27 +1501,35 @@ def run_modeling_pipeline(target_transform: str = "none"):
         y_pred_rf_calibrated=ypred_test_rf_cal,
     )
 
-    # Compute slope/intercept on test before/after calibration (regress y_test ~ y_pred)
-    a_before, b_before = compute_slope_intercept(y_test.values, ypred_test_rf_uncal)
-    a_after, b_after = compute_slope_intercept(y_test.values, ypred_test_rf_cal)
+    # Compute slope/intercept on test before/after calibration (obs ~ pred convention)
+    cal_before = calibration_line_stats(y_test.values, ypred_test_rf_uncal)
+    cal_after = calibration_line_stats(y_test.values, ypred_test_rf_cal)
 
     # Evaluate calibrated predictions
     metrics_uncal = evaluate_predictions(y_test.values, ypred_test_rf_uncal, sample_weight=w_test)
     metrics_cal = evaluate_predictions(y_test.values, ypred_test_rf_cal, sample_weight=w_test)
 
     logger.info("Calibration results on Test set (Random Forest):")
-    logger.info(f"  Before calib: slope={b_before:.4f}, intercept={a_before:.4f}, bias_mean={metrics_uncal['bias_mean']:.4f}")
-    logger.info(f"  After  calib: slope={b_after:.4f}, intercept={a_after:.4f}, bias_mean={metrics_cal['bias_mean']:.4f}")
+    logger.info(
+        "  Before calib (obs~pred): slope="
+        f"{cal_before['slope_obs_on_pred']:.4f}, intercept={cal_before['intercept_obs_on_pred']:.4f}, "
+        f"bias_mean={metrics_uncal['bias_mean']:.4f}"
+    )
+    logger.info(
+        "  After  calib (obs~pred): slope="
+        f"{cal_after['slope_obs_on_pred']:.4f}, intercept={cal_after['intercept_obs_on_pred']:.4f}, "
+        f"bias_mean={metrics_cal['bias_mean']:.4f}"
+    )
 
     # Save calibration summary
     calib_summary = {
         "model": "RandomForest",
         "calib_intercept_val_a": a_cal,
         "calib_slope_val_b": b_cal,
-        "test_slope_before": b_before,
-        "test_intercept_before": a_before,
-        "test_slope_after": b_after,
-        "test_intercept_after": a_after,
+        "test_slope_before": cal_before["slope_obs_on_pred"],
+        "test_intercept_before": cal_before["intercept_obs_on_pred"],
+        "test_slope_after": cal_after["slope_obs_on_pred"],
+        "test_intercept_after": cal_after["intercept_obs_on_pred"],
         "bias_mean_before": metrics_uncal["bias_mean"],
         "bias_mean_after": metrics_cal["bias_mean"],
         "RMSE_before": metrics_uncal["rmse"],
