@@ -651,8 +651,12 @@ def evaluate_by_subgroups(
     groupby_cols: List[str],
     sample_weight: Optional[np.ndarray] = None,
     min_n: int = 30,
+    y_pred_override: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
-    y_pred = pd.Series(model_obj.predict(X), index=X.index)
+    if y_pred_override is None:
+        y_pred = pd.Series(model_obj.predict(X), index=X.index)
+    else:
+        y_pred = pd.Series(np.asarray(y_pred_override).ravel(), index=X.index)
 
     results: List[Dict] = []
 
@@ -1223,6 +1227,69 @@ def evaluate_transform_strategy(
     return rows, decile_rows
 
 
+# ----------------------------
+# Split-wise prediction corrections (log1p smearing / Yeo-Johnson empirical)
+# ----------------------------
+def corrected_predictions_for_model(
+    model: PreprocessedRegressor,
+    transform_kind: str,
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_val: pd.Series,
+    sample_weight_val: Optional[np.ndarray] = None,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Any]]:
+    """Return (base_preds, corrected_preds, info) for train/val/test splits."""
+
+    base_preds = {
+        "train": model.predict(X_train),
+        "val": model.predict(X_val),
+        "test": model.predict(X_test),
+    }
+
+    if transform_kind == "log1p":
+        y_true_tr = model.transform_y(y_train.values)
+        y_pred_tr = model.predict_transformed(X_train)
+        smear_factor, smear_std = compute_duan_smearing(y_true_tr, y_pred_tr)
+
+        corrected = {
+            split: apply_duan_smearing(model.predict_transformed(X_split), smear_factor)
+            for split, X_split in [("train", X_train), ("val", X_val), ("test", X_test)]
+        }
+        info = {"duan_smear": smear_factor, "duan_smear_std": smear_std}
+    elif transform_kind == "yeo":
+        add_corr, mult_corr = empirical_corrections(y_train.values, base_preds["train"])
+
+        val_add = apply_empirical_correction(base_preds["val"], add_corr, mult_corr, mode="additive")
+        val_mult = apply_empirical_correction(base_preds["val"], add_corr, mult_corr, mode="multiplicative")
+
+        dec_add = bias_by_decile(y_val, val_add, sample_weight=sample_weight_val)
+        dec_mult = bias_by_decile(y_val, val_mult, sample_weight=sample_weight_val)
+
+        bias_add = abs(upper_decile_bias(dec_add))
+        bias_mult = abs(upper_decile_bias(dec_mult))
+
+        chosen_mode = "additive" if bias_add <= bias_mult else "multiplicative"
+
+        corrected = {
+            split: apply_empirical_correction(preds, add_corr, mult_corr, mode=chosen_mode)
+            for split, preds in base_preds.items()
+        }
+        info = {
+            "add_corr": add_corr,
+            "mult_corr": mult_corr,
+            "chosen_mode": chosen_mode,
+            "val_bias_additive": bias_add,
+            "val_bias_multiplicative": bias_mult,
+        }
+    else:
+        corrected = base_preds
+        info = {}
+
+    return base_preds, corrected, info
+
+
 def compare_target_transformations() -> Dict[str, pd.DataFrame]:
     logger.info("Running target transform comparison (none vs log1p vs yeo)")
     df = load_processed_data()
@@ -1317,18 +1384,49 @@ def run_modeling_pipeline(target_transform: str = "none"):
     # 3) XGBoost (benchmark)
     model_xgb = train_xgboost(pre_xgb, X_train, y_train, X_val, y_val, tgt, sample_weight=w_train, sample_weight_val=w_val)
 
-    # Evaluate all sets (models return predictions in original units via y_inverse_fn)
-    ols_train = evaluate_model(model_ols, X_train, y_train, w_train, "Train (OLS)")
-    ols_val = evaluate_model(model_ols, X_val, y_val, w_val, "Val (OLS)")
-    ols_test = evaluate_model(model_ols, X_test, y_test, w_test, "Test (OLS)")
+    # Apply target-transform-aware corrections (smearing / empirical) for each model
+    ols_base, ols_preds, ols_info = corrected_predictions_for_model(
+        model_ols, target_transform, X_train, X_val, X_test, y_train, y_val, sample_weight_val=w_val
+    )
+    rf_base, rf_preds, rf_info = corrected_predictions_for_model(
+        model_rf, target_transform, X_train, X_val, X_test, y_train, y_val, sample_weight_val=w_val
+    )
+    xgb_base, xgb_preds, xgb_info = corrected_predictions_for_model(
+        model_xgb, target_transform, X_train, X_val, X_test, y_train, y_val, sample_weight_val=w_val
+    )
 
-    rf_train = evaluate_model(model_rf, X_train, y_train, w_train, "Train (RF)")
-    rf_val = evaluate_model(model_rf, X_val, y_val, w_val, "Val (RF)")
-    rf_test = evaluate_model(model_rf, X_test, y_test, w_test, "Test (RF)")
+    def _log_correction(model_label: str, info: Dict[str, Any]):
+        if not info:
+            logger.info(f"{model_label}: no target-space correction applied (transform={target_transform}).")
+            return
+        if "duan_smear" in info:
+            logger.info(
+                f"{model_label}: Duan smearing factor={info['duan_smear']:.4f} "
+                f"(std={info.get('duan_smear_std', np.nan):.4f}) applied to log1p targets."
+            )
+        if "chosen_mode" in info:
+            logger.info(
+                f"{model_label}: Yeo–Johnson empirical correction mode={info['chosen_mode']} "
+                f"(add={info['add_corr']:.4f}, mult={info['mult_corr']:.4f}, "
+                f"val_bias_add={info.get('val_bias_additive', np.nan):.4f}, "
+                f"val_bias_mult={info.get('val_bias_multiplicative', np.nan):.4f})."
+            )
 
-    xgb_train = evaluate_model(model_xgb, X_train, y_train, w_train, "Train (XGB)")
-    xgb_val = evaluate_model(model_xgb, X_val, y_val, w_val, "Val (XGB)")
-    xgb_test = evaluate_model(model_xgb, X_test, y_test, w_test, "Test (XGB)")
+    _log_correction("OLS", ols_info)
+    _log_correction("Random Forest", rf_info)
+    _log_correction("XGBoost", xgb_info)
+
+    def _eval_all(y_true_train, y_true_val, y_true_test, preds: Dict[str, np.ndarray], weights):
+        wtr, wva, wte = weights
+        return (
+            evaluate_predictions(y_true_train.values, preds["train"], sample_weight=wtr),
+            evaluate_predictions(y_true_val.values, preds["val"], sample_weight=wva),
+            evaluate_predictions(y_true_test.values, preds["test"], sample_weight=wte),
+        )
+
+    ols_train, ols_val, ols_test = _eval_all(y_train, y_val, y_test, ols_preds, (w_train, w_val, w_test))
+    rf_train, rf_val, rf_test = _eval_all(y_train, y_val, y_test, rf_preds, (w_train, w_val, w_test))
+    xgb_train, xgb_val, xgb_test = _eval_all(y_train, y_val, y_test, xgb_preds, (w_train, w_val, w_test))
 
     # Subgroup performance (RF main model)
     subgroup_metrics = evaluate_by_subgroups(
@@ -1339,13 +1437,14 @@ def run_modeling_pipeline(target_transform: str = "none"):
         groupby_cols=["division_name", "envelope_class", "climate_zone"],
         sample_weight=w_test,
         min_n=30,
+        y_pred_override=rf_preds["test"],
     )
     if not subgroup_metrics.empty:
         subgroup_metrics.to_csv(TABLES_DIR / "table3_subgroup_performance_rf.csv", index=False)
 
     # Figure 5
-    y_pred_test_rf = model_rf.predict(X_test)
-    y_pred_test_xgb = model_xgb.predict(X_test)
+    y_pred_test_rf = rf_preds["test"]
+    y_pred_test_xgb = xgb_preds["test"]
     groups = df_test["division_name"] if "division_name" in df_test.columns else None
     generate_figure5_predictions(y_test, y_pred_test_rf, y_pred_test_xgb, groups, sample_weight=w_test)
 
@@ -1354,7 +1453,7 @@ def run_modeling_pipeline(target_transform: str = "none"):
     # ----------------------------
     logger.info("Fitting post-hoc calibration on validation set (I_obs = a + b * I_pred).")
     # Use the primary model for calibration (Random Forest). Could be done for others similarly.
-    yval_pred_rf = model_rf.predict(X_val)
+    yval_pred_rf = rf_preds["val"]
     a_cal, b_cal = fit_posthoc_calibration(y_val.values, yval_pred_rf)
 
     # Apply calibration to test preds
@@ -1391,6 +1490,7 @@ def run_modeling_pipeline(target_transform: str = "none"):
         "MAPE_before": metrics_uncal["mape"],
         "MAPE_after": metrics_cal["mape"],
     }
+    calib_summary.update({k: v for k, v in rf_info.items() if k in {"duan_smear", "duan_smear_std", "add_corr", "mult_corr", "chosen_mode"}})
     pd.DataFrame([calib_summary]).to_csv(TABLES_DIR / "calibration_summary_rf.csv", index=False)
 
     # Detailed error by deciles/climate/HDD
@@ -1502,6 +1602,10 @@ def run_modeling_pipeline(target_transform: str = "none"):
 
         "model_comparison": comparison_df,
         "model_performance_table": model_perf_df,
+
+        "ols_corrections": ols_info,
+        "rf_corrections": rf_info,
+        "xgb_corrections": xgb_info,
 
         "X_test": X_test,
         "y_test": y_test,
