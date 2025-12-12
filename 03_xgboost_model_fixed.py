@@ -12,18 +12,20 @@ import os
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Any
 
 import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 import xgboost as xgb
 
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression
+from sklearn.isotonic import IsotonicRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split, StratifiedKFold
@@ -40,9 +42,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------
-# Paths
+# Paths (resolve relative to this script to avoid missing-data errors)
 # ----------------------------
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 FIGURES_DIR = OUTPUT_DIR / "figures"
@@ -78,6 +80,15 @@ class TargetTransformer:
         self.kind = kind
         self._pt = None  # for yeo
         self.fitted = False
+
+    def clone(self) -> "TargetTransformer":
+        """Return a shallow copy preserving the fitted PowerTransformer if present."""
+        new = TargetTransformer(kind=self.kind)
+        new.fitted = self.fitted
+        if self._pt is not None:
+            # PowerTransformer is picklable; copy state directly
+            new._pt = joblib.loads(joblib.dumps(self._pt))
+        return new
 
     def fit(self, y: np.ndarray):
         y = np.asarray(y).reshape(-1, 1).astype(float)
@@ -115,24 +126,40 @@ class PreprocessedRegressor:
     preprocessor: ColumnTransformer  # must be already fit
     model: Any  # estimator (fit on transformed target)
     feature_names_: List[str]
-    y_inverse_fn: Callable[[np.ndarray], np.ndarray]  # function to inverse-transform model outputs
+    target_transformer: TargetTransformer  # keeps forward + inverse transform of y
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         Xt = self.preprocessor.transform(X)
         yp = self.model.predict(Xt)
         # ensure shape is (n,)
         yp = np.asarray(yp).ravel()
-        return self.y_inverse_fn(yp)
+        return self.target_transformer.inverse_transform(yp)
+
+    def predict_transformed(self, X: pd.DataFrame) -> np.ndarray:
+        """Predict in the transformed target space (no inverse applied)."""
+        Xt = self.preprocessor.transform(X)
+        yp = self.model.predict(Xt)
+        return np.asarray(yp).ravel()
+
+    def transform_y(self, y: np.ndarray) -> np.ndarray:
+        return self.target_transformer.transform(y)
 
 
 # ----------------------------
 # Data loading & features
 # ----------------------------
 def load_processed_data() -> pd.DataFrame:
-    filepath = OUTPUT_DIR / "03_gas_heated_clean.csv"
-    if not filepath.exists():
+    candidate_paths = [
+        PROJECT_ROOT / "03_gas_heated_clean.csv",
+        DATA_DIR / "03_gas_heated_clean.csv",
+        OUTPUT_DIR / "03_gas_heated_clean.csv",
+    ]
+    filepath = next((p for p in candidate_paths if p.exists()), None)
+    if filepath is None:
+        searched = ", ".join(str(p) for p in candidate_paths)
         raise FileNotFoundError(
-            f"Processed data not found at {filepath}. Run 01_data_prep.py first."
+            "Processed data file '03_gas_heated_clean.csv' not found. "
+            f"Searched in: {searched}. Run 01_data_prep.py first or place the file accordingly."
         )
     df = pd.read_csv(filepath)
     logger.info(f"Loaded {len(df):,} rows from {filepath}")
@@ -166,23 +193,54 @@ def get_feature_lists(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     return num_avail, cat_avail
 
 
-def prepare_X_y(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    if "Thermal_Intensity_I" not in df.columns:
-        raise KeyError("Target 'Thermal_Intensity_I' not found. Run 01_data_prep.py first.")
+def prepare_X_y(df: pd.DataFrame, target_definition: str = "intensity") -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Build design matrix and target based on the requested outcome definition.
 
+    target_definition:
+        - "intensity": Thermal_Intensity_I = E_heat_btu / (A_heated * HDD65)
+        - "energy": E_heat_btu (raw energy use)
+        - "energy_per_area": E_heat_btu / A_heated
+    """
+    target_definition = target_definition.lower()
     num_cols, cat_cols = get_feature_lists(df)
 
-    X = df[num_cols + cat_cols].copy()
-    y = df["Thermal_Intensity_I"].copy()
+    if target_definition == "intensity":
+        target_col = "Thermal_Intensity_I"
+        if target_col not in df.columns:
+            raise KeyError("Target 'Thermal_Intensity_I' not found. Run 01_data_prep.py first.")
+        y_raw = df[target_col]
+    elif target_definition == "energy":
+        target_col = "E_heat_btu"
+        if target_col not in df.columns:
+            raise KeyError("Target 'E_heat_btu' not found. Ensure energy column exists in the cleaned file.")
+        y_raw = pd.to_numeric(df[target_col], errors="coerce")
+    elif target_definition == "energy_per_area":
+        if "E_heat_btu" not in df.columns:
+            raise KeyError("Target 'E_heat_btu' not found. Ensure energy column exists in the cleaned file.")
+        if "A_heated" not in df.columns:
+            raise KeyError("Target 'A_heated' not found. Ensure heated area exists in the cleaned file.")
+        energy = pd.to_numeric(df["E_heat_btu"], errors="coerce")
+        area = pd.to_numeric(df["A_heated"], errors="coerce")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            y_raw = energy / area
+        target_col = "E_heat_per_area"
+    else:
+        raise ValueError("target_definition must be one of {'intensity','energy','energy_per_area'}")
 
-    valid = y.notna()
+    X = df[num_cols + cat_cols].copy()
+    y = pd.Series(y_raw, name=target_col)
+
+    valid = y.notna() & np.isfinite(y)
     X = X.loc[valid].copy()
     y = y.loc[valid].copy()
 
     for c in cat_cols:
         X[c] = X[c].astype("object")
 
-    logger.info(f"Prepared X,y with {X.shape[0]:,} samples and {X.shape[1]} raw features.")
+    logger.info(
+        f"Prepared X,y ({target_definition}) with {X.shape[0]:,} samples and {X.shape[1]} raw features."
+    )
     return X, y
 
 
@@ -393,6 +451,105 @@ def evaluate_model(
 
 
 # ----------------------------
+# Target-transform-aware corrections and diagnostics
+# ----------------------------
+def compute_slope_intercept(
+    y_true: np.ndarray, y_pred: np.ndarray, sample_weight: Optional[np.ndarray] = None
+) -> Tuple[float, float]:
+    """
+    Official definition used across the pipeline:
+    regress OBSERVED on PREDICTED and return (intercept, slope).
+    A well-calibrated model should have slope≈1 and intercept≈0 under this convention.
+    """
+    lr = LinearRegression()
+    lr.fit(np.asarray(y_pred).reshape(-1, 1), np.asarray(y_true), sample_weight=sample_weight)
+    return float(lr.intercept_.ravel()[0]), float(lr.coef_.ravel()[0])
+
+
+def calibration_line_stats(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Convenience wrapper returning intercept/slope under the obs~pred convention."""
+    intercept, slope = compute_slope_intercept(y_true, y_pred, sample_weight=sample_weight)
+    return {
+        "intercept_obs_on_pred": intercept,
+        "slope_obs_on_pred": slope,
+    }
+
+
+def bias_by_decile(
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+    n_deciles: int = 10,
+) -> pd.DataFrame:
+    """Compute bias (observed - predicted) per decile of observed values."""
+    df_tmp = pd.DataFrame({"y_true": y_true.values, "y_pred": np.asarray(y_pred).ravel()})
+    df_tmp = df_tmp.assign(decile=pd.qcut(df_tmp["y_true"], q=n_deciles, labels=False, duplicates="drop") + 1)
+
+    out_rows = []
+    for d in sorted(df_tmp["decile"].dropna().unique()):
+        mask = df_tmp["decile"] == d
+        if sample_weight is None:
+            bias = (df_tmp.loc[mask, "y_true"] - df_tmp.loc[mask, "y_pred"]).mean()
+            n = mask.sum()
+        else:
+            w = np.asarray(sample_weight)[mask.values]
+            bias = np.average(
+                df_tmp.loc[mask, "y_true"] - df_tmp.loc[mask, "y_pred"],
+                weights=w,
+            )
+            n = float(np.sum(w))
+        out_rows.append({"decile": int(d), "bias_mean": float(bias), "n_samples": float(n)})
+
+    return pd.DataFrame(out_rows)
+
+
+def upper_decile_bias(decile_df: pd.DataFrame, top_k: int = 2) -> float:
+    if decile_df.empty:
+        return np.nan
+    top = decile_df.sort_values("decile").tail(top_k)
+    weights = top["n_samples"].values
+    weights = weights / weights.sum() if weights.sum() > 0 else None
+    if weights is None:
+        return float(top["bias_mean"].mean())
+    return float(np.average(top["bias_mean"], weights=weights))
+
+
+def compute_duan_smearing(y_true_trans: np.ndarray, y_pred_trans: np.ndarray) -> Tuple[float, float]:
+    """Compute Duan smearing factor (mean exp residual) and its std on training data."""
+    resid = np.asarray(y_true_trans).ravel() - np.asarray(y_pred_trans).ravel()
+    smear_terms = np.exp(resid)
+    return float(np.mean(smear_terms)), float(np.std(smear_terms, ddof=1) if len(smear_terms) > 1 else 0.0)
+
+
+def apply_duan_smearing(y_pred_trans: np.ndarray, smearing_factor: float) -> np.ndarray:
+    """Apply Duan smearing to log1p predictions and return in original units."""
+    return np.exp(np.asarray(y_pred_trans).ravel()) * float(smearing_factor) - 1.0
+
+
+def empirical_corrections(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float]:
+    """Return additive and multiplicative corrections based on training residuals."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    add_corr = float(np.mean(y_true - y_pred))
+    denom = np.where(np.abs(y_pred) < 1e-8, 1e-8, y_pred)
+    mult_corr = float(np.mean(y_true / denom))
+    return add_corr, mult_corr
+
+
+def apply_empirical_correction(y_pred: np.ndarray, add_corr: float, mult_corr: float, mode: str) -> np.ndarray:
+    mode = mode.lower()
+    if mode == "additive":
+        return np.asarray(y_pred, dtype=float) + float(add_corr)
+    if mode == "multiplicative":
+        return np.asarray(y_pred, dtype=float) * float(mult_corr)
+    raise ValueError("mode must be 'additive' or 'multiplicative'")
+
+
+# ----------------------------
 # Training helpers (fit preprocessor + model on transformed targets, return PreprocessedRegressor)
 # ----------------------------
 def train_ols(
@@ -406,8 +563,9 @@ def train_ols(
     preprocessor.fit(X_train)
     Xtr = preprocessor.transform(X_train)
     # transform target
-    target_transformer.fit(y_train.values)
-    ytr = target_transformer.transform(y_train.values)
+    tgt = target_transformer.clone()
+    tgt.fit(y_train.values)
+    ytr = tgt.transform(y_train.values)
 
     model = LinearRegression()
     if sample_weight is not None:
@@ -416,7 +574,7 @@ def train_ols(
         model.fit(Xtr, ytr)
 
     feature_names = get_feature_names(preprocessor)
-    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, y_inverse_fn=target_transformer.inverse_transform)
+    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, target_transformer=tgt)
 
 
 def train_random_forest(
@@ -441,8 +599,9 @@ def train_random_forest(
 
     preprocessor.fit(X_train)
     Xtr = preprocessor.transform(X_train)
-    target_transformer.fit(y_train.values)
-    ytr = target_transformer.transform(y_train.values)
+    tgt = target_transformer.clone()
+    tgt.fit(y_train.values)
+    ytr = tgt.transform(y_train.values)
 
     model = RandomForestRegressor(**default)
     if sample_weight is not None:
@@ -451,7 +610,7 @@ def train_random_forest(
         model.fit(Xtr, ytr)
 
     feature_names = get_feature_names(preprocessor)
-    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, y_inverse_fn=target_transformer.inverse_transform)
+    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, target_transformer=tgt)
 
 
 def train_xgboost(
@@ -464,6 +623,7 @@ def train_xgboost(
     sample_weight: Optional[np.ndarray] = None,
     sample_weight_val: Optional[np.ndarray] = None,
     params: Optional[dict] = None,
+    objective: str = "reg:squarederror",
 ) -> PreprocessedRegressor:
     base_params = dict(
         n_estimators=2000,          # with early stopping this is safe
@@ -477,7 +637,7 @@ def train_xgboost(
         reg_lambda=1.0,
         random_state=42,
         n_jobs=-1,
-        objective="reg:squarederror",
+        objective=objective,
     )
     if params:
         base_params.update(params)
@@ -488,9 +648,10 @@ def train_xgboost(
     Xva = preprocessor.transform(X_val)
 
     # target transform
-    target_transformer.fit(y_train.values)
-    ytr = target_transformer.transform(y_train.values)
-    yva = target_transformer.transform(y_val.values)
+    tgt = target_transformer.clone()
+    tgt.fit(y_train.values)
+    ytr = tgt.transform(y_train.values)
+    yva = tgt.transform(y_val.values)
 
     feature_names = get_feature_names(preprocessor)
 
@@ -527,7 +688,7 @@ def train_xgboost(
             model.fit(Xtr, ytr)
         logger.warning(f"XGBoost early stopping failed ({e}); trained with fixed n_estimators=400.")
 
-    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, y_inverse_fn=target_transformer.inverse_transform)
+    return PreprocessedRegressor(preprocessor=preprocessor, model=model, feature_names_=feature_names, target_transformer=tgt)
 
 
 # ----------------------------
@@ -541,8 +702,12 @@ def evaluate_by_subgroups(
     groupby_cols: List[str],
     sample_weight: Optional[np.ndarray] = None,
     min_n: int = 30,
+    y_pred_override: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
-    y_pred = pd.Series(model_obj.predict(X), index=X.index)
+    if y_pred_override is None:
+        y_pred = pd.Series(model_obj.predict(X), index=X.index)
+    else:
+        y_pred = pd.Series(np.asarray(y_pred_override).ravel(), index=X.index)
 
     results: List[Dict] = []
 
@@ -584,7 +749,9 @@ def evaluate_by_subgroups(
 # ----------------------------
 # Calibration: fit on validation, apply on test
 # ----------------------------
-def fit_posthoc_calibration(y_val: np.ndarray, yval_pred: np.ndarray) -> Tuple[float, float]:
+def fit_posthoc_calibration_linear(
+    y_val: np.ndarray, yval_pred: np.ndarray, sample_weight: Optional[np.ndarray] = None
+) -> Tuple[float, float]:
     """
     Fit linear regression: y_val = a + b * yval_pred
     Return (a, b)
@@ -592,15 +759,104 @@ def fit_posthoc_calibration(y_val: np.ndarray, yval_pred: np.ndarray) -> Tuple[f
     lr = LinearRegression()
     X = np.asarray(yval_pred).reshape(-1, 1)
     y = np.asarray(y_val).reshape(-1, 1)
-    lr.fit(X, y)
+    lr.fit(X, y, sample_weight=sample_weight)
     a = float(lr.intercept_.ravel()[0])
     b = float(lr.coef_.ravel()[0])
-    logger.info(f"Calibration fitted on validation: intercept(a)={a:.4f}, slope(b)={b:.4f}")
+    logger.info(f"Calibration fitted on validation (linear): intercept(a)={a:.4f}, slope(b)={b:.4f}")
     return a, b
+
+
+def fit_posthoc_calibration_isotonic(
+    y_val: np.ndarray, yval_pred: np.ndarray, sample_weight: Optional[np.ndarray] = None
+) -> IsotonicRegression:
+    """Fit an isotonic regression y_val ~ y_pred (monotonic, non-linear)."""
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(np.asarray(yval_pred), np.asarray(y_val), sample_weight=sample_weight)
+    logger.info("Calibration fitted on validation (isotonic, monotonic).")
+    return iso
 
 
 def apply_calibration(y_pred: np.ndarray, a: float, b: float) -> np.ndarray:
     return a + b * np.asarray(y_pred)
+
+
+def calibrate_predictions(
+    model_name: str,
+    y_val: pd.Series,
+    y_val_pred: np.ndarray,
+    y_test: pd.Series,
+    y_test_pred: np.ndarray,
+    sample_weight_val: Optional[np.ndarray] = None,
+    sample_weight_test: Optional[np.ndarray] = None,
+    mode: str = "isotonic",
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Fit post-hoc calibration on validation predictions and apply to test predictions.
+
+    Returns calibrated test predictions and a summary dictionary (before/after slopes, bias, RMSE/MAE/MAPE).
+    """
+    mode = mode.lower()
+    if mode not in {"linear", "isotonic"}:
+        raise ValueError("calibration mode must be 'linear' or 'isotonic'")
+
+    if mode == "linear":
+        a_cal, b_cal = fit_posthoc_calibration_linear(y_val.values, y_val_pred, sample_weight=sample_weight_val)
+        y_test_cal = apply_calibration(y_test_pred, a_cal, b_cal)
+        calib_desc = {"mode": "linear", "a": a_cal, "b": b_cal}
+    else:
+        iso = fit_posthoc_calibration_isotonic(y_val.values, y_val_pred, sample_weight=sample_weight_val)
+        y_test_cal = iso.predict(np.asarray(y_test_pred))
+        calib_desc = {
+            "mode": "isotonic",
+            "iso_min_x": float(np.min(iso.X_thresholds_)),
+            "iso_max_x": float(np.max(iso.X_thresholds_)),
+        }
+
+    cal_before = calibration_line_stats(y_test.values, y_test_pred, sample_weight=sample_weight_test)
+    cal_after = calibration_line_stats(y_test.values, y_test_cal, sample_weight=sample_weight_test)
+
+    metrics_uncal = evaluate_predictions(y_test.values, y_test_pred, sample_weight=sample_weight_test)
+    metrics_cal = evaluate_predictions(y_test.values, y_test_cal, sample_weight=sample_weight_test)
+
+    if mode == "linear":
+        logger.info(
+            f"Calibration ({model_name}, linear) fitted on validation: intercept(a)={a_cal:.4f}, slope(b)={b_cal:.4f}."
+        )
+    else:
+        logger.info(f"Calibration ({model_name}, isotonic) fitted on validation.")
+    logger.info(
+        f"{model_name} Test (obs~pred): before slope={cal_before['slope_obs_on_pred']:.4f}, "
+        f"intercept={cal_before['intercept_obs_on_pred']:.4f}, bias_mean={metrics_uncal['bias_mean']:.4f}" \
+        f" | after slope={cal_after['slope_obs_on_pred']:.4f}, "
+        f"intercept={cal_after['intercept_obs_on_pred']:.4f}, bias_mean={metrics_cal['bias_mean']:.4f}"
+    )
+
+    summary = {
+        "model": model_name,
+        "calibration_mode": mode,
+        "test_slope_before": cal_before["slope_obs_on_pred"],
+        "test_intercept_before": cal_before["intercept_obs_on_pred"],
+        "test_slope_after": cal_after["slope_obs_on_pred"],
+        "test_intercept_after": cal_after["intercept_obs_on_pred"],
+        "bias_mean_before": metrics_uncal["bias_mean"],
+        "bias_mean_after": metrics_cal["bias_mean"],
+        "RMSE_before": metrics_uncal["rmse"],
+        "RMSE_after": metrics_cal["rmse"],
+        "MAE_before": metrics_uncal["mae"],
+        "MAE_after": metrics_cal["mae"],
+        "MAPE_before": metrics_uncal["mape"],
+        "MAPE_after": metrics_cal["mape"],
+    }
+
+    if mode == "linear":
+        summary.update({
+            "calib_intercept_val_a": a_cal,
+            "calib_slope_val_b": b_cal,
+        })
+    else:
+        summary.update(calib_desc)
+
+    return y_test_cal, summary
 
 
 # ----------------------------
@@ -704,12 +960,22 @@ def generate_figure5_predictions(
     groups: Optional[pd.Series] = None,
     group_name: str = "Division",
     sample_weight: Optional[np.ndarray] = None,
+    y_pred_rf_calibrated: Optional[np.ndarray] = None,
+    y_pred_xgb_calibrated: Optional[np.ndarray] = None,
+    plot_style: str = "hexbin",
 ):
+    """
+    Plot predicted vs observed for RF and XGB, optionally overlaying calibrated predictions.
+
+    Calibration lines use regression of observed on predicted (slope toward 1 is desirable).
+    """
     logger.info("Generating Figure 5: Predicted vs observed (RF & XGBoost)")
 
     y_true_arr = np.asarray(y_true).astype(float)
     y_pred_rf = np.asarray(y_pred_rf).astype(float)
     y_pred_xgb = np.asarray(y_pred_xgb).astype(float)
+    y_pred_rf_cal = None if y_pred_rf_calibrated is None else np.asarray(y_pred_rf_calibrated).astype(float)
+    y_pred_xgb_cal = None if y_pred_xgb_calibrated is None else np.asarray(y_pred_xgb_calibrated).astype(float)
 
     w = None
     if sample_weight is not None:
@@ -723,13 +989,18 @@ def generate_figure5_predictions(
         w_sum = w.sum()
         w = (w / w_sum) if w_sum > 0 else None
 
-    all_vals = np.concatenate([y_true_arr, y_pred_rf, y_pred_xgb])
-    min_val = float(np.nanmin(all_vals))
-    max_val = float(np.nanmax(all_vals))
+    all_vals = [y_true_arr, y_pred_rf, y_pred_xgb]
+    if y_pred_rf_cal is not None:
+        all_vals.append(y_pred_rf_cal)
+    if y_pred_xgb_cal is not None:
+        all_vals.append(y_pred_xgb_cal)
+    all_concat = np.concatenate(all_vals)
+    min_val = float(np.nanmin(all_concat))
+    max_val = float(np.nanmax(all_concat))
     padding = 0.5
     lims = [max(min_val - padding, 0.0), max_val + padding]
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7), sharex=True, sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7), sharex=True, sharey=True)
 
     def _weighted_r2(y_t: np.ndarray, y_p: np.ndarray, w_: np.ndarray) -> float:
         y_bar = np.average(y_t, weights=w_)
@@ -740,77 +1011,109 @@ def generate_figure5_predictions(
     def _weighted_rmse(y_t: np.ndarray, y_p: np.ndarray, w_: np.ndarray) -> float:
         return float(np.sqrt(np.average((y_t - y_p) ** 2, weights=w_)))
 
-    def _calibration(y_t: np.ndarray, y_p: np.ndarray, w_: Optional[np.ndarray]) -> Tuple[float, float]:
-        mask = np.isfinite(y_t) & np.isfinite(y_p)
-        if w_ is not None:
-            mask = mask & np.isfinite(w_) & (w_ > 0)
-        if mask.sum() < 3:
-            return (np.nan, np.nan)
-        if w_ is None:
-            a, b = np.polyfit(y_t[mask], y_p[mask], 1)
-        else:
-            a, b = np.polyfit(y_t[mask], y_p[mask], 1, w=w_[mask])
-        return float(a), float(b)
+    def _annotation_block(label: str, preds: np.ndarray) -> List[str]:
+        r2_val = r2_score(y_true_arr, preds)
+        rmse_val = np.sqrt(mean_squared_error(y_true_arr, preds))
+        cal_stats = calibration_line_stats(y_true_arr, preds, sample_weight=None)
+        lines_local = [
+            f"{label}: R²={r2_val:.3f}",
+            f"{label}: RMSE={rmse_val:.2f}",
+            f"{label}: slope(obs~pred)={cal_stats['slope_obs_on_pred']:.2f}, intercept={cal_stats['intercept_obs_on_pred']:.2f}",
+        ]
+        if w is not None:
+            r2_w = _weighted_r2(y_true_arr, preds, w)
+            rmse_w = _weighted_rmse(y_true_arr, preds, w)
+            cal_stats_w = calibration_line_stats(y_true_arr, preds, sample_weight=w)
+            lines_local += [
+                f"{label}: R²_w={r2_w:.3f}",
+                f"{label}: RMSE_w={rmse_w:.2f}",
+                f"{label}: slope_w(obs~pred)={cal_stats_w['slope_obs_on_pred']:.2f}, intercept_w={cal_stats_w['intercept_obs_on_pred']:.2f}",
+            ]
+        return lines_local
 
-    def _plot(ax, y_pred: np.ndarray, title: str):
-        if groups is not None:
-            groups_local = groups.reindex(y_true.index)
-            for g in groups_local.dropna().unique():
-                mask_g = (groups_local == g).values
-                ax.scatter(
-                    y_true_arr[mask_g],
-                    y_pred[mask_g],
-                    alpha=0.45,
-                    s=18,
-                    label=str(g),
+    def _plot(ax, y_pred_base: np.ndarray, y_pred_cal: Optional[np.ndarray], title: str):
+        variants: List[Tuple[str, np.ndarray, dict]] = [
+            ("Base", y_pred_base, {"marker": "o", "alpha": 0.22, "s": 14}),
+        ]
+        if y_pred_cal is not None:
+            variants.append(("Calibrated", y_pred_cal, {"marker": "x", "alpha": 0.38, "s": 26, "linewidth": 0.9}))
+
+        groups_local = groups.reindex(y_true.index) if groups is not None else None
+
+        group_handles: Dict[str, Any] = {}
+        for label, preds, style in variants:
+            if groups_local is not None:
+                uniq_groups = groups_local.dropna().unique()
+                cmap = plt.cm.get_cmap("tab20", len(uniq_groups))
+                for idx, g in enumerate(uniq_groups):
+                    mask_g = (groups_local == g).values
+                    color = cmap(idx)
+                    legend_label = str(g) if label == "Base" else None
+                    sc = ax.scatter(
+                        y_true_arr[mask_g],
+                        preds[mask_g],
+                        color=color,
+                        label=legend_label,
+                        **style,
+                    )
+                    if legend_label is not None and legend_label not in group_handles:
+                        group_handles[legend_label] = sc
+            elif plot_style.lower() == "hexbin":
+                cmap = "Blues" if label == "Base" else "Oranges"
+                hb = ax.hexbin(
+                    y_true_arr,
+                    preds,
+                    gridsize=55,
+                    cmap=cmap,
+                    mincnt=1,
+                    alpha=0.55 if label == "Base" else 0.75,
+                    linewidths=0.25,
+                    bins="log",
                 )
-        else:
-            ax.scatter(y_true_arr, y_pred, alpha=0.45, s=18)
+                if label == "Base":
+                    group_handles["Base density"] = hb
+            else:
+                ax.scatter(y_true_arr, preds, label=label, **style)
 
         ax.plot(lims, lims, "k--", alpha=0.75, zorder=0, linewidth=2)
         ax.set_xlim(lims)
         ax.set_ylim(lims)
 
-        r2 = r2_score(y_true_arr, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_true_arr, y_pred))
-        a, b = _calibration(y_true_arr, y_pred, None)
-
-        lines = [
-            f"R² = {r2:.3f}",
-            f"RMSE = {rmse:.2f}",
-            f"slope = {a:.2f}, intercept = {b:.2f}",
-        ]
-
-        if w is not None:
-            r2_w = _weighted_r2(y_true_arr, y_pred, w)
-            rmse_w = _weighted_rmse(y_true_arr, y_pred, w)
-            a_w, b_w = _calibration(y_true_arr, y_pred, w)
-            lines += [
-                f"R²_w = {r2_w:.3f}",
-                f"RMSE_w = {rmse_w:.2f}",
-                f"slope_w = {a_w:.2f}, intercept_w = {b_w:.2f}",
-            ]
+        lines: List[str] = []
+        for label, preds, _ in variants:
+            lines.extend(_annotation_block(label, preds))
 
         ax.annotate(
             "\n".join(lines),
-            xy=(0.05, 0.95),
+            xy=(0.02, 0.98),
             xycoords="axes fraction",
             fontsize=10,
             verticalalignment="top",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.88),
         )
 
         ax.set_xlabel("Observed thermal intensity, I (BTU/ft²·HDD)", fontsize=12)
         ax.set_ylabel("Predicted thermal intensity, I (BTU/ft²·HDD)", fontsize=12)
         ax.set_title(title, fontsize=14)
 
-    _plot(axes[0], y_pred_rf, "(a) Random Forest model")
-    _plot(axes[1], y_pred_xgb, "(b) XGBoost model")
+        if groups_local is not None and group_handles:
+            handles = list(group_handles.values())
+            labels = list(group_handles.keys())
+            ax.legend(handles, labels, title=group_name, fontsize=9, title_fontsize=10, frameon=True, loc="lower right")
+        elif groups_local is None:
+            variant_handles = []
+            if plot_style.lower() == "hexbin":
+                variant_handles.append(Line2D([0], [0], marker="s", linestyle="", color="steelblue", alpha=0.6, label="Base density"))
+                if y_pred_cal is not None:
+                    variant_handles.append(Line2D([0], [0], marker="s", linestyle="", color="darkorange", alpha=0.7, label="Calibrated density"))
+            else:
+                variant_handles.append(Line2D([0], [0], marker="o", linestyle="", color="gray", alpha=0.5, label="Base"))
+                if y_pred_cal is not None:
+                    variant_handles.append(Line2D([0], [0], marker="x", linestyle="", color="gray", alpha=0.8, label="Calibrated"))
+            ax.legend(handles=variant_handles, fontsize=9, frameon=True, loc="lower right")
 
-    if groups is not None:
-        handles, labels = axes[0].get_legend_handles_labels()
-        if handles:
-            axes[0].legend(handles, labels, title=group_name, fontsize=9, title_fontsize=10, frameon=True, loc="lower right")
+    _plot(axes[0], y_pred_rf, y_pred_rf_cal, "(a) Random Forest model")
+    _plot(axes[1], y_pred_xgb, y_pred_xgb_cal, "(b) XGBoost model")
 
     plt.tight_layout()
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
@@ -947,20 +1250,338 @@ def cross_validate_xgb(
 
 
 # ----------------------------
+# Target transform comparison (log1p vs Yeo–Johnson vs none)
+# ----------------------------
+def _train_model_for_kind(
+    model_type: str,
+    transform_kind: str,
+    num_cols: List[str],
+    cat_cols: List[str],
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    sample_weight_train: Optional[np.ndarray],
+    sample_weight_val: Optional[np.ndarray],
+    xgb_objective: str = "reg:squarederror",
+) -> PreprocessedRegressor:
+    pre = build_preprocessor(num_cols, cat_cols)
+    tgt = TargetTransformer(kind=transform_kind)
+    if model_type == "rf":
+        return train_random_forest(pre, X_train, y_train, tgt, sample_weight=sample_weight_train)
+    if model_type == "xgb":
+        return train_xgboost(
+            pre,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            tgt,
+            sample_weight=sample_weight_train,
+            sample_weight_val=sample_weight_val,
+            objective=xgb_objective,
+        )
+    raise ValueError("model_type must be 'rf' or 'xgb'")
+
+
+def _metric_row(
+    transform_kind: str,
+    model_label: str,
+    stage: str,
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+    sample_weight: Optional[np.ndarray],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    metrics = evaluate_predictions(y_true.values, y_pred, sample_weight=sample_weight)
+    cal_stats = calibration_line_stats(y_true.values, y_pred, sample_weight=sample_weight)
+    deciles = bias_by_decile(y_true, y_pred, sample_weight=sample_weight)
+    row = {
+        "transform": transform_kind,
+        "model": model_label,
+        "stage": stage,
+        "n_samples": metrics.get("n_samples"),
+        "rmse": metrics.get("rmse"),
+        "mae": metrics.get("mae"),
+        "r2": metrics.get("r2"),
+        "mape": metrics.get("mape"),
+        "weighted_rmse": metrics.get("weighted_rmse"),
+        "weighted_mae": metrics.get("weighted_mae"),
+        "weighted_r2": metrics.get("weighted_r2"),
+        "weighted_mape": metrics.get("weighted_mape"),
+        "bias_mean": metrics.get("bias_mean"),
+        "bias_abs_mean": metrics.get("bias_abs_mean"),
+        "slope": cal_stats["slope_obs_on_pred"],
+        "intercept": cal_stats["intercept_obs_on_pred"],
+        "slope_obs_on_pred": cal_stats["slope_obs_on_pred"],
+        "intercept_obs_on_pred": cal_stats["intercept_obs_on_pred"],
+        "bias_top_deciles": upper_decile_bias(deciles),
+    }
+    if extra:
+        row.update(extra)
+    deciles = deciles.assign(transform=transform_kind, model=model_label, stage=stage)
+    return row, deciles
+
+
+def evaluate_transform_strategy(
+    transform_kind: str,
+    model_type: str,
+    num_cols: List[str],
+    cat_cols: List[str],
+    splits: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series],
+    weights: Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]],
+    xgb_objective: str = "reg:squarederror",
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    (
+        X_train,
+        X_val,
+        X_test,
+        y_train,
+        y_val,
+        y_test,
+    ) = splits
+    w_train, w_val, w_test = weights
+
+    model = _train_model_for_kind(
+        model_type,
+        transform_kind,
+        num_cols,
+        cat_cols,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        w_train,
+        w_val,
+        xgb_objective,
+    )
+
+    model_label = "RandomForest" if model_type == "rf" else "XGBoost"
+
+    rows: List[Dict[str, Any]] = []
+    decile_rows: List[Dict[str, Any]] = []
+
+    # Base predictions (already inverse-transformed by model.predict)
+    base_preds_train = model.predict(X_train)
+    base_preds_val = model.predict(X_val)
+    base_preds_test = model.predict(X_test)
+
+    row_base, dec_base = _metric_row(transform_kind, model_label, "base", y_test, base_preds_test, w_test)
+    rows.append(row_base)
+    decile_rows.extend(dec_base.to_dict(orient="records"))
+
+    if transform_kind == "log1p":
+        y_true_tr = model.transform_y(y_train.values)
+        y_pred_tr = model.predict_transformed(X_train)
+        smear_factor, smear_std = compute_duan_smearing(y_true_tr, y_pred_tr)
+
+        preds_test_smear = apply_duan_smearing(model.predict_transformed(X_test), smear_factor)
+        row_smear, dec_smear = _metric_row(
+            transform_kind,
+            model_label,
+            "duan_smear",
+            y_test,
+            preds_test_smear,
+            w_test,
+            extra={"duan_smear": smear_factor, "duan_smear_std": smear_std},
+        )
+        rows.append(row_smear)
+        decile_rows.extend(dec_smear.to_dict(orient="records"))
+    elif transform_kind == "yeo":
+        add_corr, mult_corr = empirical_corrections(y_train.values, base_preds_train)
+
+        val_add = apply_empirical_correction(base_preds_val, add_corr, mult_corr, mode="additive")
+        val_mult = apply_empirical_correction(base_preds_val, add_corr, mult_corr, mode="multiplicative")
+
+        _, dec_add = _metric_row(transform_kind, model_label, "yeo_val_additive", y_val, val_add, w_val)
+        _, dec_mult = _metric_row(transform_kind, model_label, "yeo_val_multiplicative", y_val, val_mult, w_val)
+
+        bias_add = abs(upper_decile_bias(dec_add))
+        bias_mult = abs(upper_decile_bias(dec_mult))
+
+        if bias_add <= bias_mult:
+            chosen_mode = "additive"
+        else:
+            chosen_mode = "multiplicative"
+
+        preds_test_corrected = apply_empirical_correction(
+            base_preds_test, add_corr, mult_corr, mode=chosen_mode
+        )
+        row_corr, dec_corr = _metric_row(
+            transform_kind,
+            model_label,
+            f"yeo_corrected_{chosen_mode}",
+            y_test,
+            preds_test_corrected,
+            w_test,
+            extra={"add_corr": add_corr, "mult_corr": mult_corr, "chosen_mode": chosen_mode},
+        )
+        rows.append(row_corr)
+        decile_rows.extend(dec_corr.to_dict(orient="records"))
+
+    return rows, decile_rows
+
+
+# ----------------------------
+# Split-wise prediction corrections (log1p smearing / Yeo-Johnson empirical)
+# ----------------------------
+def corrected_predictions_for_model(
+    model: PreprocessedRegressor,
+    transform_kind: str,
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_val: pd.Series,
+    sample_weight_val: Optional[np.ndarray] = None,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Any]]:
+    """Return (base_preds, corrected_preds, info) for train/val/test splits."""
+
+    base_preds = {
+        "train": model.predict(X_train),
+        "val": model.predict(X_val),
+        "test": model.predict(X_test),
+    }
+
+    if transform_kind == "log1p":
+        y_true_tr = model.transform_y(y_train.values)
+        y_pred_tr = model.predict_transformed(X_train)
+        smear_factor, smear_std = compute_duan_smearing(y_true_tr, y_pred_tr)
+
+        corrected = {
+            split: apply_duan_smearing(model.predict_transformed(X_split), smear_factor)
+            for split, X_split in [("train", X_train), ("val", X_val), ("test", X_test)]
+        }
+        info = {"duan_smear": smear_factor, "duan_smear_std": smear_std}
+    elif transform_kind == "yeo":
+        add_corr, mult_corr = empirical_corrections(y_train.values, base_preds["train"])
+
+        val_add = apply_empirical_correction(base_preds["val"], add_corr, mult_corr, mode="additive")
+        val_mult = apply_empirical_correction(base_preds["val"], add_corr, mult_corr, mode="multiplicative")
+
+        dec_add = bias_by_decile(y_val, val_add, sample_weight=sample_weight_val)
+        dec_mult = bias_by_decile(y_val, val_mult, sample_weight=sample_weight_val)
+
+        bias_add = abs(upper_decile_bias(dec_add))
+        bias_mult = abs(upper_decile_bias(dec_mult))
+
+        chosen_mode = "additive" if bias_add <= bias_mult else "multiplicative"
+
+        corrected = {
+            split: apply_empirical_correction(preds, add_corr, mult_corr, mode=chosen_mode)
+            for split, preds in base_preds.items()
+        }
+        info = {
+            "add_corr": add_corr,
+            "mult_corr": mult_corr,
+            "chosen_mode": chosen_mode,
+            "val_bias_additive": bias_add,
+            "val_bias_multiplicative": bias_mult,
+        }
+    else:
+        corrected = base_preds
+        info = {}
+
+    return base_preds, corrected, info
+
+
+def compare_target_transformations(
+    xgb_objective: str = "reg:squarederror",
+    target_definition: str = "intensity",
+) -> Dict[str, pd.DataFrame]:
+    logger.info("Running target transform comparison (none vs log1p vs yeo)")
+    logger.info(f"Target definition for comparison: {target_definition}")
+    df = load_processed_data()
+    X, y = prepare_X_y(df, target_definition=target_definition)
+    num_cols, cat_cols = get_feature_lists(df)
+
+    (
+        X_train,
+        X_val,
+        X_test,
+        y_train,
+        y_val,
+        y_test,
+        w_train,
+        w_val,
+        w_test,
+        _,
+        _,
+        _
+    ) = split_data(X, y, df, stratify_col="REGIONC")
+
+    splits = (X_train, X_val, X_test, y_train, y_val, y_test)
+    weights = (w_train, w_val, w_test)
+
+    all_rows: List[Dict[str, Any]] = []
+    decile_rows: List[Dict[str, Any]] = []
+
+    for transform_kind in ["none", "log1p", "yeo"]:
+        for model_type in ["rf", "xgb"]:
+            rows, decs = evaluate_transform_strategy(
+                transform_kind,
+                model_type,
+                num_cols,
+                cat_cols,
+                splits,
+                weights,
+                xgb_objective=xgb_objective,
+            )
+            all_rows.extend(rows)
+            decile_rows.extend(decs)
+
+    summary_df = pd.DataFrame(all_rows)
+    deciles_df = pd.DataFrame(decile_rows)
+
+    TABLES_DIR.mkdir(parents=True, exist_ok=True)
+    summary_df.to_csv(TABLES_DIR / "target_transform_comparison_summary.csv", index=False)
+    deciles_df.to_csv(TABLES_DIR / "target_transform_decile_biases.csv", index=False)
+
+    return {"summary": summary_df, "deciles": deciles_df}
+
+
+# ----------------------------
 # Main pipeline (with new options)
 # ----------------------------
-def run_modeling_pipeline(target_transform: str = "none"):
+def run_modeling_pipeline(
+    target_transform: str = "none",
+    min_hdd65: Optional[float] = None,
+    xgb_objective: str = "reg:squarederror",
+    figure5_plot_style: str = "hexbin",
+    target_definition: str = "intensity",
+    calibration_mode: str = "isotonic",
+):
     """
     target_transform: "none" | "log1p" | "yeo"
+    min_hdd65: optional floor on HDD65 to drop ultra-mild cases that destabilize I = E/(A*HDD)
+    xgb_objective: choose loss (e.g., reg:squarederror, reg:absoluteerror, reg:pseudohubererror)
+    figure5_plot_style: "scatter" or "hexbin" for pred-vs-obs chart density control
+    target_definition: choose the modeling target ("intensity", "energy", "energy_per_area")
     """
     logger.info("=" * 60)
     logger.info("Thermal intensity modeling pipeline (OLS / RF / XGBoost) - extended")
     logger.info("=" * 60)
     logger.info(f"Versions: xgboost={xgb.__version__}")
     logger.info(f"Target transform: {target_transform}")
+    logger.info(f"XGBoost objective: {xgb_objective}")
+    logger.info(f"Target definition: {target_definition}")
+    logger.info(f"Calibration mode: {calibration_mode}")
 
     df = load_processed_data()
-    X, y = prepare_X_y(df)
+    if min_hdd65 is not None:
+        if "HDD65" in df.columns:
+            before = len(df)
+            df = df.loc[df["HDD65"] >= float(min_hdd65)].copy()
+            after = len(df)
+            logger.info(
+                f"Applied HDD65 threshold >= {min_hdd65}. Rows kept: {after:,} of {before:,} ({after / before * 100:.1f}%)."
+            )
+            if after == 0:
+                raise ValueError("All rows filtered out by HDD65 threshold. Loosen min_hdd65 or inspect data.")
+        else:
+            logger.warning("min_hdd65 provided but 'HDD65' column not found; no filtering applied.")
+
+    X, y = prepare_X_y(df, target_definition=target_definition)
     num_cols, cat_cols = get_feature_lists(df)
 
     (
@@ -988,20 +1609,61 @@ def run_modeling_pipeline(target_transform: str = "none"):
     model_rf = train_random_forest(pre_rf, X_train, y_train, tgt, sample_weight=w_train)
 
     # 3) XGBoost (benchmark)
-    model_xgb = train_xgboost(pre_xgb, X_train, y_train, X_val, y_val, tgt, sample_weight=w_train, sample_weight_val=w_val)
+    model_xgb = train_xgboost(
+        pre_xgb,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        tgt,
+        sample_weight=w_train,
+        sample_weight_val=w_val,
+        objective=xgb_objective,
+    )
 
-    # Evaluate all sets (models return predictions in original units via y_inverse_fn)
-    ols_train = evaluate_model(model_ols, X_train, y_train, w_train, "Train (OLS)")
-    ols_val = evaluate_model(model_ols, X_val, y_val, w_val, "Val (OLS)")
-    ols_test = evaluate_model(model_ols, X_test, y_test, w_test, "Test (OLS)")
+    # Apply target-transform-aware corrections (smearing / empirical) for each model
+    ols_base, ols_preds, ols_info = corrected_predictions_for_model(
+        model_ols, target_transform, X_train, X_val, X_test, y_train, y_val, sample_weight_val=w_val
+    )
+    rf_base, rf_preds, rf_info = corrected_predictions_for_model(
+        model_rf, target_transform, X_train, X_val, X_test, y_train, y_val, sample_weight_val=w_val
+    )
+    xgb_base, xgb_preds, xgb_info = corrected_predictions_for_model(
+        model_xgb, target_transform, X_train, X_val, X_test, y_train, y_val, sample_weight_val=w_val
+    )
 
-    rf_train = evaluate_model(model_rf, X_train, y_train, w_train, "Train (RF)")
-    rf_val = evaluate_model(model_rf, X_val, y_val, w_val, "Val (RF)")
-    rf_test = evaluate_model(model_rf, X_test, y_test, w_test, "Test (RF)")
+    def _log_correction(model_label: str, info: Dict[str, Any]):
+        if not info:
+            logger.info(f"{model_label}: no target-space correction applied (transform={target_transform}).")
+            return
+        if "duan_smear" in info:
+            logger.info(
+                f"{model_label}: Duan smearing factor={info['duan_smear']:.4f} "
+                f"(std={info.get('duan_smear_std', np.nan):.4f}) applied to log1p targets."
+            )
+        if "chosen_mode" in info:
+            logger.info(
+                f"{model_label}: Yeo–Johnson empirical correction mode={info['chosen_mode']} "
+                f"(add={info['add_corr']:.4f}, mult={info['mult_corr']:.4f}, "
+                f"val_bias_add={info.get('val_bias_additive', np.nan):.4f}, "
+                f"val_bias_mult={info.get('val_bias_multiplicative', np.nan):.4f})."
+            )
 
-    xgb_train = evaluate_model(model_xgb, X_train, y_train, w_train, "Train (XGB)")
-    xgb_val = evaluate_model(model_xgb, X_val, y_val, w_val, "Val (XGB)")
-    xgb_test = evaluate_model(model_xgb, X_test, y_test, w_test, "Test (XGB)")
+    _log_correction("OLS", ols_info)
+    _log_correction("Random Forest", rf_info)
+    _log_correction("XGBoost", xgb_info)
+
+    def _eval_all(y_true_train, y_true_val, y_true_test, preds: Dict[str, np.ndarray], weights):
+        wtr, wva, wte = weights
+        return (
+            evaluate_predictions(y_true_train.values, preds["train"], sample_weight=wtr),
+            evaluate_predictions(y_true_val.values, preds["val"], sample_weight=wva),
+            evaluate_predictions(y_true_test.values, preds["test"], sample_weight=wte),
+        )
+
+    ols_train, ols_val, ols_test = _eval_all(y_train, y_val, y_test, ols_preds, (w_train, w_val, w_test))
+    rf_train, rf_val, rf_test = _eval_all(y_train, y_val, y_test, rf_preds, (w_train, w_val, w_test))
+    xgb_train, xgb_val, xgb_test = _eval_all(y_train, y_val, y_test, xgb_preds, (w_train, w_val, w_test))
 
     # Subgroup performance (RF main model)
     subgroup_metrics = evaluate_by_subgroups(
@@ -1012,69 +1674,71 @@ def run_modeling_pipeline(target_transform: str = "none"):
         groupby_cols=["division_name", "envelope_class", "climate_zone"],
         sample_weight=w_test,
         min_n=30,
+        y_pred_override=rf_preds["test"],
     )
     if not subgroup_metrics.empty:
         subgroup_metrics.to_csv(TABLES_DIR / "table3_subgroup_performance_rf.csv", index=False)
 
     # Figure 5
-    y_pred_test_rf = model_rf.predict(X_test)
-    y_pred_test_xgb = model_xgb.predict(X_test)
+    y_pred_test_rf = rf_preds["test"]
+    y_pred_test_xgb = xgb_preds["test"]
     groups = df_test["division_name"] if "division_name" in df_test.columns else None
-    generate_figure5_predictions(y_test, y_pred_test_rf, y_pred_test_xgb, groups, sample_weight=w_test)
 
     # ----------------------------
-    # Post-hoc calibration (fit on validation predictions)
+    # Post-hoc calibration (fit on validation predictions) for RF and XGB
     # ----------------------------
-    logger.info("Fitting post-hoc calibration on validation set (I_obs = a + b * I_pred).")
-    # Use the primary model for calibration (Random Forest). Could be done for others similarly.
-    yval_pred_rf = model_rf.predict(X_val)
-    a_cal, b_cal = fit_posthoc_calibration(y_val.values, yval_pred_rf)
+    logger.info("Fitting post-hoc calibration on validation set (I_obs = a + b * I_pred) for RF and XGB.")
+    rf_calibrated_test, rf_calib_summary = calibrate_predictions(
+        "RandomForest",
+        y_val,
+        rf_preds["val"],
+        y_test,
+        y_pred_test_rf,
+        sample_weight_val=w_val,
+        sample_weight_test=w_test,
+        mode=calibration_mode,
+    )
+    xgb_calibrated_test, xgb_calib_summary = calibrate_predictions(
+        "XGBoost",
+        y_val,
+        xgb_preds["val"],
+        y_test,
+        y_pred_test_xgb,
+        sample_weight_val=w_val,
+        sample_weight_test=w_test,
+        mode=calibration_mode,
+    )
 
-    # Apply calibration to test preds
+    # Figure 5 (overlay calibrated predictions when available)
+    generate_figure5_predictions(
+        y_test,
+        y_pred_test_rf,
+        y_pred_test_xgb,
+        groups,
+        sample_weight=w_test,
+        y_pred_rf_calibrated=rf_calibrated_test,
+        y_pred_xgb_calibrated=xgb_calibrated_test,
+        plot_style=figure5_plot_style,
+    )
+
+    # Save calibration summaries (include target-transform corrections for context)
+    rf_calib_summary.update({k: v for k, v in rf_info.items() if k in {"duan_smear", "duan_smear_std", "add_corr", "mult_corr", "chosen_mode"}})
+    xgb_calib_summary.update({k: v for k, v in xgb_info.items() if k in {"duan_smear", "duan_smear_std", "add_corr", "mult_corr", "chosen_mode"}})
+    calib_df = pd.DataFrame([rf_calib_summary, xgb_calib_summary])
+    calib_df.to_csv(TABLES_DIR / "calibration_summary.csv", index=False)
+    # Preserve RF-only output for backward compatibility
+    calib_df[calib_df["model"] == "RandomForest"].to_csv(TABLES_DIR / "calibration_summary_rf.csv", index=False)
+
+    # Extract RF calibration params for downstream saves/returns
+    rf_a = rf_calib_summary.get("calib_intercept_val_a", np.nan)
+    rf_b = rf_calib_summary.get("calib_slope_val_b", np.nan)
+
+    # Preserve explicit names for uncalibrated/calibrated RF test predictions used in the return payload
     ypred_test_rf_uncal = y_pred_test_rf
-    ypred_test_rf_cal = apply_calibration(ypred_test_rf_uncal, a_cal, b_cal)
+    ypred_test_rf_cal = rf_calibrated_test
 
-    # Compute slope/intercept on test before/after calibration (regress y_test ~ y_pred)
-    def compute_slope_intercept(y_true_arr, y_pred_arr):
-        lr = LinearRegression()
-        lr.fit(np.asarray(y_pred_arr).reshape(-1, 1), np.asarray(y_true_arr).reshape(-1, 1))
-        a = float(lr.intercept_.ravel()[0])
-        b = float(lr.coef_.ravel()[0])
-        return a, b
-
-    a_before, b_before = compute_slope_intercept(y_test.values, ypred_test_rf_uncal)
-    a_after, b_after = compute_slope_intercept(y_test.values, ypred_test_rf_cal)
-
-    # Evaluate calibrated predictions
-    metrics_uncal = evaluate_predictions(y_test.values, ypred_test_rf_uncal, sample_weight=w_test)
-    metrics_cal = evaluate_predictions(y_test.values, ypred_test_rf_cal, sample_weight=w_test)
-
-    logger.info("Calibration results on Test set (Random Forest):")
-    logger.info(f"  Before calib: slope={b_before:.4f}, intercept={a_before:.4f}, bias_mean={metrics_uncal['bias_mean']:.4f}")
-    logger.info(f"  After  calib: slope={b_after:.4f}, intercept={a_after:.4f}, bias_mean={metrics_cal['bias_mean']:.4f}")
-
-    # Save calibration summary
-    calib_summary = {
-        "model": "RandomForest",
-        "calib_intercept_val_a": a_cal,
-        "calib_slope_val_b": b_cal,
-        "test_slope_before": b_before,
-        "test_intercept_before": a_before,
-        "test_slope_after": b_after,
-        "test_intercept_after": a_after,
-        "bias_mean_before": metrics_uncal["bias_mean"],
-        "bias_mean_after": metrics_cal["bias_mean"],
-        "RMSE_before": metrics_uncal["rmse"],
-        "RMSE_after": metrics_cal["rmse"],
-        "MAE_before": metrics_uncal["mae"],
-        "MAE_after": metrics_cal["mae"],
-        "MAPE_before": metrics_uncal["mape"],
-        "MAPE_after": metrics_cal["mape"],
-    }
-    pd.DataFrame([calib_summary]).to_csv(TABLES_DIR / "calibration_summary_rf.csv", index=False)
-
-    # Detailed error by deciles/climate/HDD
-    df_error_breakdown = error_by_deciles_and_climate(y_test, ypred_test_rf_uncal, ypred_test_rf_cal, df_test, sample_weight=w_test)
+    # Detailed error by deciles/climate/HDD (RF as primary model), include calibrated overlay
+    df_error_breakdown = error_by_deciles_and_climate(y_test, y_pred_test_rf, rf_calibrated_test, df_test, sample_weight=w_test)
     df_error_breakdown.to_csv(TABLES_DIR / "error_by_decile_climate_hdd_rf.csv", index=False)
 
     # ----------------------------
@@ -1134,7 +1798,7 @@ def run_modeling_pipeline(target_transform: str = "none"):
     joblib.dump(model_xgb, MODELS_DIR / "xgboost_thermal_intensity_calibrated.joblib")
 
     # Save calibration parameters
-    pd.DataFrame([{"a": a_cal, "b": b_cal}]).to_csv(MODELS_DIR / "rf_calibration_params.csv", index=False)
+    pd.DataFrame([{"a": rf_a, "b": rf_b}]).to_csv(MODELS_DIR / "rf_calibration_params.csv", index=False)
 
     # Feature importance (post-encoding)
     rf_est = model_rf.model
@@ -1183,12 +1847,17 @@ def run_modeling_pipeline(target_transform: str = "none"):
         "model_comparison": comparison_df,
         "model_performance_table": model_perf_df,
 
+        "ols_corrections": ols_info,
+        "rf_corrections": rf_info,
+        "xgb_corrections": xgb_info,
+
         "X_test": X_test,
         "y_test": y_test,
         "y_pred_rf_uncal": ypred_test_rf_uncal,
         "y_pred_rf_cal": ypred_test_rf_cal,
-        "calibration_params": (a_cal, b_cal),
+        "calibration_params": (rf_a, rf_b),
         "error_breakdown": df_error_breakdown,
+        "target_definition": target_definition,
     }
 
 
