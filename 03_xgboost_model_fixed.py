@@ -734,6 +734,60 @@ def apply_calibration(y_pred: np.ndarray, a: float, b: float) -> np.ndarray:
     return a + b * np.asarray(y_pred)
 
 
+def calibrate_predictions(
+    model_name: str,
+    y_val: pd.Series,
+    y_val_pred: np.ndarray,
+    y_test: pd.Series,
+    y_test_pred: np.ndarray,
+    sample_weight_val: Optional[np.ndarray] = None,
+    sample_weight_test: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Fit linear post-hoc calibration on validation predictions and apply to test predictions.
+
+    Returns calibrated test predictions and a summary dictionary (before/after slopes, bias, RMSE/MAE/MAPE).
+    """
+    a_cal, b_cal = fit_posthoc_calibration(y_val.values, y_val_pred)
+    y_test_cal = apply_calibration(y_test_pred, a_cal, b_cal)
+
+    cal_before = calibration_line_stats(y_test.values, y_test_pred, sample_weight=sample_weight_test)
+    cal_after = calibration_line_stats(y_test.values, y_test_cal, sample_weight=sample_weight_test)
+
+    metrics_uncal = evaluate_predictions(y_test.values, y_test_pred, sample_weight=sample_weight_test)
+    metrics_cal = evaluate_predictions(y_test.values, y_test_cal, sample_weight=sample_weight_test)
+
+    logger.info(
+        f"Calibration ({model_name}) fitted on validation: intercept(a)={a_cal:.4f}, slope(b)={b_cal:.4f}."
+    )
+    logger.info(
+        f"{model_name} Test (obs~pred): before slope={cal_before['slope_obs_on_pred']:.4f}, "
+        f"intercept={cal_before['intercept_obs_on_pred']:.4f}, bias_mean={metrics_uncal['bias_mean']:.4f}" \
+        f" | after slope={cal_after['slope_obs_on_pred']:.4f}, "
+        f"intercept={cal_after['intercept_obs_on_pred']:.4f}, bias_mean={metrics_cal['bias_mean']:.4f}"
+    )
+
+    summary = {
+        "model": model_name,
+        "calib_intercept_val_a": a_cal,
+        "calib_slope_val_b": b_cal,
+        "test_slope_before": cal_before["slope_obs_on_pred"],
+        "test_intercept_before": cal_before["intercept_obs_on_pred"],
+        "test_slope_after": cal_after["slope_obs_on_pred"],
+        "test_intercept_after": cal_after["intercept_obs_on_pred"],
+        "bias_mean_before": metrics_uncal["bias_mean"],
+        "bias_mean_after": metrics_cal["bias_mean"],
+        "RMSE_before": metrics_uncal["rmse"],
+        "RMSE_after": metrics_cal["rmse"],
+        "MAE_before": metrics_uncal["mae"],
+        "MAE_after": metrics_cal["mae"],
+        "MAPE_before": metrics_uncal["mape"],
+        "MAPE_after": metrics_cal["mape"],
+    }
+
+    return y_test_cal, summary
+
+
 # ----------------------------
 # Error by deciles / climate / HDD bins
 # ----------------------------
@@ -1480,16 +1534,27 @@ def run_modeling_pipeline(target_transform: str = "none"):
     groups = df_test["division_name"] if "division_name" in df_test.columns else None
 
     # ----------------------------
-    # Post-hoc calibration (fit on validation predictions)
+    # Post-hoc calibration (fit on validation predictions) for RF and XGB
     # ----------------------------
-    logger.info("Fitting post-hoc calibration on validation set (I_obs = a + b * I_pred).")
-    # Use the primary model for calibration (Random Forest). Could be done for others similarly.
-    yval_pred_rf = rf_preds["val"]
-    a_cal, b_cal = fit_posthoc_calibration(y_val.values, yval_pred_rf)
-
-    # Apply calibration to test preds
-    ypred_test_rf_uncal = y_pred_test_rf
-    ypred_test_rf_cal = apply_calibration(ypred_test_rf_uncal, a_cal, b_cal)
+    logger.info("Fitting post-hoc calibration on validation set (I_obs = a + b * I_pred) for RF and XGB.")
+    rf_calibrated_test, rf_calib_summary = calibrate_predictions(
+        "RandomForest",
+        y_val,
+        rf_preds["val"],
+        y_test,
+        y_pred_test_rf,
+        sample_weight_val=w_val,
+        sample_weight_test=w_test,
+    )
+    xgb_calibrated_test, xgb_calib_summary = calibrate_predictions(
+        "XGBoost",
+        y_val,
+        xgb_preds["val"],
+        y_test,
+        y_pred_test_xgb,
+        sample_weight_val=w_val,
+        sample_weight_test=w_test,
+    )
 
     # Figure 5 (overlay calibrated predictions when available)
     generate_figure5_predictions(
@@ -1498,52 +1563,20 @@ def run_modeling_pipeline(target_transform: str = "none"):
         y_pred_test_xgb,
         groups,
         sample_weight=w_test,
-        y_pred_rf_calibrated=ypred_test_rf_cal,
+        y_pred_rf_calibrated=rf_calibrated_test,
+        y_pred_xgb_calibrated=xgb_calibrated_test,
     )
 
-    # Compute slope/intercept on test before/after calibration (obs ~ pred convention)
-    cal_before = calibration_line_stats(y_test.values, ypred_test_rf_uncal)
-    cal_after = calibration_line_stats(y_test.values, ypred_test_rf_cal)
+    # Save calibration summaries (include target-transform corrections for context)
+    rf_calib_summary.update({k: v for k, v in rf_info.items() if k in {"duan_smear", "duan_smear_std", "add_corr", "mult_corr", "chosen_mode"}})
+    xgb_calib_summary.update({k: v for k, v in xgb_info.items() if k in {"duan_smear", "duan_smear_std", "add_corr", "mult_corr", "chosen_mode"}})
+    calib_df = pd.DataFrame([rf_calib_summary, xgb_calib_summary])
+    calib_df.to_csv(TABLES_DIR / "calibration_summary.csv", index=False)
+    # Preserve RF-only output for backward compatibility
+    calib_df[calib_df["model"] == "RandomForest"].to_csv(TABLES_DIR / "calibration_summary_rf.csv", index=False)
 
-    # Evaluate calibrated predictions
-    metrics_uncal = evaluate_predictions(y_test.values, ypred_test_rf_uncal, sample_weight=w_test)
-    metrics_cal = evaluate_predictions(y_test.values, ypred_test_rf_cal, sample_weight=w_test)
-
-    logger.info("Calibration results on Test set (Random Forest):")
-    logger.info(
-        "  Before calib (obs~pred): slope="
-        f"{cal_before['slope_obs_on_pred']:.4f}, intercept={cal_before['intercept_obs_on_pred']:.4f}, "
-        f"bias_mean={metrics_uncal['bias_mean']:.4f}"
-    )
-    logger.info(
-        "  After  calib (obs~pred): slope="
-        f"{cal_after['slope_obs_on_pred']:.4f}, intercept={cal_after['intercept_obs_on_pred']:.4f}, "
-        f"bias_mean={metrics_cal['bias_mean']:.4f}"
-    )
-
-    # Save calibration summary
-    calib_summary = {
-        "model": "RandomForest",
-        "calib_intercept_val_a": a_cal,
-        "calib_slope_val_b": b_cal,
-        "test_slope_before": cal_before["slope_obs_on_pred"],
-        "test_intercept_before": cal_before["intercept_obs_on_pred"],
-        "test_slope_after": cal_after["slope_obs_on_pred"],
-        "test_intercept_after": cal_after["intercept_obs_on_pred"],
-        "bias_mean_before": metrics_uncal["bias_mean"],
-        "bias_mean_after": metrics_cal["bias_mean"],
-        "RMSE_before": metrics_uncal["rmse"],
-        "RMSE_after": metrics_cal["rmse"],
-        "MAE_before": metrics_uncal["mae"],
-        "MAE_after": metrics_cal["mae"],
-        "MAPE_before": metrics_uncal["mape"],
-        "MAPE_after": metrics_cal["mape"],
-    }
-    calib_summary.update({k: v for k, v in rf_info.items() if k in {"duan_smear", "duan_smear_std", "add_corr", "mult_corr", "chosen_mode"}})
-    pd.DataFrame([calib_summary]).to_csv(TABLES_DIR / "calibration_summary_rf.csv", index=False)
-
-    # Detailed error by deciles/climate/HDD
-    df_error_breakdown = error_by_deciles_and_climate(y_test, ypred_test_rf_uncal, ypred_test_rf_cal, df_test, sample_weight=w_test)
+    # Detailed error by deciles/climate/HDD (RF as primary model), include calibrated overlay
+    df_error_breakdown = error_by_deciles_and_climate(y_test, y_pred_test_rf, rf_calibrated_test, df_test, sample_weight=w_test)
     df_error_breakdown.to_csv(TABLES_DIR / "error_by_decile_climate_hdd_rf.csv", index=False)
 
     # ----------------------------
