@@ -192,23 +192,54 @@ def get_feature_lists(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     return num_avail, cat_avail
 
 
-def prepare_X_y(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    if "Thermal_Intensity_I" not in df.columns:
-        raise KeyError("Target 'Thermal_Intensity_I' not found. Run 01_data_prep.py first.")
+def prepare_X_y(df: pd.DataFrame, target_definition: str = "intensity") -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Build design matrix and target based on the requested outcome definition.
 
+    target_definition:
+        - "intensity": Thermal_Intensity_I = E_heat_btu / (A_heated * HDD65)
+        - "energy": E_heat_btu (raw energy use)
+        - "energy_per_area": E_heat_btu / A_heated
+    """
+    target_definition = target_definition.lower()
     num_cols, cat_cols = get_feature_lists(df)
 
-    X = df[num_cols + cat_cols].copy()
-    y = df["Thermal_Intensity_I"].copy()
+    if target_definition == "intensity":
+        target_col = "Thermal_Intensity_I"
+        if target_col not in df.columns:
+            raise KeyError("Target 'Thermal_Intensity_I' not found. Run 01_data_prep.py first.")
+        y_raw = df[target_col]
+    elif target_definition == "energy":
+        target_col = "E_heat_btu"
+        if target_col not in df.columns:
+            raise KeyError("Target 'E_heat_btu' not found. Ensure energy column exists in the cleaned file.")
+        y_raw = pd.to_numeric(df[target_col], errors="coerce")
+    elif target_definition == "energy_per_area":
+        if "E_heat_btu" not in df.columns:
+            raise KeyError("Target 'E_heat_btu' not found. Ensure energy column exists in the cleaned file.")
+        if "A_heated" not in df.columns:
+            raise KeyError("Target 'A_heated' not found. Ensure heated area exists in the cleaned file.")
+        energy = pd.to_numeric(df["E_heat_btu"], errors="coerce")
+        area = pd.to_numeric(df["A_heated"], errors="coerce")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            y_raw = energy / area
+        target_col = "E_heat_per_area"
+    else:
+        raise ValueError("target_definition must be one of {'intensity','energy','energy_per_area'}")
 
-    valid = y.notna()
+    X = df[num_cols + cat_cols].copy()
+    y = pd.Series(y_raw, name=target_col)
+
+    valid = y.notna() & np.isfinite(y)
     X = X.loc[valid].copy()
     y = y.loc[valid].copy()
 
     for c in cat_cols:
         X[c] = X[c].astype("object")
 
-    logger.info(f"Prepared X,y with {X.shape[0]:,} samples and {X.shape[1]} raw features.")
+    logger.info(
+        f"Prepared X,y ({target_definition}) with {X.shape[0]:,} samples and {X.shape[1]} raw features."
+    )
     return X, y
 
 
@@ -1416,10 +1447,14 @@ def corrected_predictions_for_model(
     return base_preds, corrected, info
 
 
-def compare_target_transformations(xgb_objective: str = "reg:squarederror") -> Dict[str, pd.DataFrame]:
+def compare_target_transformations(
+    xgb_objective: str = "reg:squarederror",
+    target_definition: str = "intensity",
+) -> Dict[str, pd.DataFrame]:
     logger.info("Running target transform comparison (none vs log1p vs yeo)")
+    logger.info(f"Target definition for comparison: {target_definition}")
     df = load_processed_data()
-    X, y = prepare_X_y(df)
+    X, y = prepare_X_y(df, target_definition=target_definition)
     num_cols, cat_cols = get_feature_lists(df)
 
     (
@@ -1475,12 +1510,14 @@ def run_modeling_pipeline(
     min_hdd65: Optional[float] = None,
     xgb_objective: str = "reg:squarederror",
     figure5_plot_style: str = "hexbin",
+    target_definition: str = "intensity",
 ):
     """
     target_transform: "none" | "log1p" | "yeo"
     min_hdd65: optional floor on HDD65 to drop ultra-mild cases that destabilize I = E/(A*HDD)
     xgb_objective: choose loss (e.g., reg:squarederror, reg:absoluteerror, reg:pseudohubererror)
     figure5_plot_style: "scatter" or "hexbin" for pred-vs-obs chart density control
+    target_definition: choose the modeling target ("intensity", "energy", "energy_per_area")
     """
     logger.info("=" * 60)
     logger.info("Thermal intensity modeling pipeline (OLS / RF / XGBoost) - extended")
@@ -1488,6 +1525,7 @@ def run_modeling_pipeline(
     logger.info(f"Versions: xgboost={xgb.__version__}")
     logger.info(f"Target transform: {target_transform}")
     logger.info(f"XGBoost objective: {xgb_objective}")
+    logger.info(f"Target definition: {target_definition}")
 
     df = load_processed_data()
     if min_hdd65 is not None:
@@ -1503,7 +1541,7 @@ def run_modeling_pipeline(
         else:
             logger.warning("min_hdd65 provided but 'HDD65' column not found; no filtering applied.")
 
-    X, y = prepare_X_y(df)
+    X, y = prepare_X_y(df, target_definition=target_definition)
     num_cols, cat_cols = get_feature_lists(df)
 
     (
@@ -1777,6 +1815,7 @@ def run_modeling_pipeline(
         "y_pred_rf_cal": ypred_test_rf_cal,
         "calibration_params": (rf_a, rf_b),
         "error_breakdown": df_error_breakdown,
+        "target_definition": target_definition,
     }
 
 
