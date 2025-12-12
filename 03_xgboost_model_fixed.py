@@ -18,6 +18,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 import xgboost as xgb
 
@@ -961,27 +962,33 @@ def generate_figure5_predictions(
 
     def _plot(ax, y_pred_base: np.ndarray, y_pred_cal: Optional[np.ndarray], title: str):
         variants: List[Tuple[str, np.ndarray, dict]] = [
-            ("Base", y_pred_base, {"marker": "o", "alpha": 0.35, "s": 18}),
+            ("Base", y_pred_base, {"marker": "o", "alpha": 0.22, "s": 14}),
         ]
         if y_pred_cal is not None:
-            variants.append(("Calibrated", y_pred_cal, {"marker": "x", "alpha": 0.55, "s": 28}))
+            variants.append(("Calibrated", y_pred_cal, {"marker": "x", "alpha": 0.38, "s": 26, "linewidth": 0.9}))
 
-        legend_items = []
+        groups_local = groups.reindex(y_true.index) if groups is not None else None
+
+        group_handles: Dict[str, Any] = {}
         for label, preds, style in variants:
-            if groups is not None:
-                groups_local = groups.reindex(y_true.index)
-                for g in groups_local.dropna().unique():
+            if groups_local is not None:
+                uniq_groups = groups_local.dropna().unique()
+                cmap = plt.cm.get_cmap("tab20", len(uniq_groups))
+                for idx, g in enumerate(uniq_groups):
                     mask_g = (groups_local == g).values
+                    color = cmap(idx)
+                    legend_label = str(g) if label == "Base" else None
                     sc = ax.scatter(
                         y_true_arr[mask_g],
                         preds[mask_g],
-                        label=f"{label}-{g}",
+                        color=color,
+                        label=legend_label,
                         **style,
                     )
-                    legend_items.append(sc)
+                    if legend_label is not None and legend_label not in group_handles:
+                        group_handles[legend_label] = sc
             else:
-                sc = ax.scatter(y_true_arr, preds, label=label, **style)
-                legend_items.append(sc)
+                ax.scatter(y_true_arr, preds, label=label, **style)
 
         ax.plot(lims, lims, "k--", alpha=0.75, zorder=0, linewidth=2)
         ax.set_xlim(lims)
@@ -1004,8 +1011,17 @@ def generate_figure5_predictions(
         ax.set_ylabel("Predicted thermal intensity, I (BTU/ft²·HDD)", fontsize=12)
         ax.set_title(title, fontsize=14)
 
-        if legend_items:
-            ax.legend(fontsize=9, frameon=True, loc="lower right")
+        if groups_local is not None and group_handles:
+            handles = list(group_handles.values())
+            labels = list(group_handles.keys())
+            ax.legend(handles, labels, title=group_name, fontsize=9, title_fontsize=10, frameon=True, loc="lower right")
+        elif groups_local is None:
+            variant_handles = [
+                Line2D([0], [0], marker="o", linestyle="", color="gray", alpha=0.5, label="Base"),
+            ]
+            if y_pred_cal is not None:
+                variant_handles.append(Line2D([0], [0], marker="x", linestyle="", color="gray", alpha=0.8, label="Calibrated"))
+            ax.legend(handles=variant_handles, fontsize=9, frameon=True, loc="lower right")
 
     _plot(axes[0], y_pred_rf, y_pred_rf_cal, "(a) Random Forest model")
     _plot(axes[1], y_pred_xgb, y_pred_xgb_cal, "(b) XGBoost model")
