@@ -1579,6 +1579,10 @@ def run_modeling_pipeline(target_transform: str = "none"):
     rf_a = rf_calib_summary.get("calib_intercept_val_a", np.nan)
     rf_b = rf_calib_summary.get("calib_slope_val_b", np.nan)
 
+    # Preserve explicit names for uncalibrated/calibrated RF test predictions used in the return payload
+    ypred_test_rf_uncal = y_pred_test_rf
+    ypred_test_rf_cal = rf_calibrated_test
+
     # Detailed error by deciles/climate/HDD (RF as primary model), include calibrated overlay
     df_error_breakdown = error_by_deciles_and_climate(y_test, y_pred_test_rf, rf_calibrated_test, df_test, sample_weight=w_test)
     df_error_breakdown.to_csv(TABLES_DIR / "error_by_decile_climate_hdd_rf.csv", index=False)
